@@ -303,7 +303,8 @@ export class MockChannels {
 
 export class MockConnection {
     state = "initialized";
-    key = "mock-connection-key";
+    /** Optional, like ably's: a connection that never opened has no key. */
+    key: string | undefined = "mock-connection-key";
 
     private readonly listeners = new ListenerRegistry<StateListener, string>();
 
