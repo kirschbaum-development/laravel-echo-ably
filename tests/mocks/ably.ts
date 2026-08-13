@@ -156,9 +156,40 @@ export class MockChannel {
         string
     >();
 
+    /** The error the next `attach()` should fail with, set by `failAttach()`. */
+    private attachFailure: unknown = null;
+
     constructor(public name: string) {}
 
-    attach = vi.fn((): Promise<unknown> => Promise.resolve(null));
+    /**
+     * Attaching drives the channel state machine the way ably does: it emits
+     * the resulting state change before settling, and a failure both emits
+     * `failed` and rejects with the very same error.
+     */
+    attach = vi.fn((): Promise<unknown> => {
+        const failure = this.attachFailure;
+
+        if (failure !== null) {
+            this.attachFailure = null;
+
+            this.emitStateChange({
+                current: "failed",
+                previous: "attaching",
+                reason: failure,
+            });
+
+            return Promise.reject(failure);
+        }
+
+        this.emitStateChange({ current: "attached", previous: "attaching" });
+
+        return Promise.resolve(null);
+    });
+
+    /** Make the next `attach()` fail with `reason`, state change included. */
+    failAttach(reason: unknown): void {
+        this.attachFailure = reason;
+    }
 
     detach = vi.fn((): Promise<void> => Promise.resolve());
 

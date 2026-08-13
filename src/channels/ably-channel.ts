@@ -61,6 +61,15 @@ export class AblyChannel extends Channel {
     private stateListenerRegistered = false;
 
     /**
+     * Whether the current `subscribe()` attempt already had a failure reported
+     * through the state listener. ably rejects `attach()` with the same error
+     * it has just emitted as a state change, so without this the one failure
+     * would reach `error()` twice — and the second time without the
+     * `onChannelFailed` hook ever being consulted.
+     */
+    private failureReportedByState = false;
+
+    /**
      * Create a new class instance.
      */
     constructor(
@@ -87,6 +96,8 @@ export class AblyChannel extends Channel {
      * escaping rejection would be unhandled — nothing awaits `ready` but us.
      */
     async subscribe(): Promise<void> {
+        this.failureReportedByState = false;
+
         try {
             await this.tokenManager.ensureCapability(this.name);
 
@@ -108,6 +119,15 @@ export class AblyChannel extends Channel {
 
             await this.subscription.attach();
         } catch (error) {
+            // Ownership: anything the channel reported as a state change
+            // belongs to the state listener, which is where the
+            // `onChannelFailed` hook gets its say. Only failures that never
+            // became a channel state — a rejected capability request, a
+            // connection-level attach rejection — are surfaced from here.
+            if (this.failureReportedByState) {
+                return;
+            }
+
             this.dispatchError(error);
         }
     }
@@ -118,11 +138,17 @@ export class AblyChannel extends Channel {
     unsubscribe(): void {
         this.listeners.clear();
         this.globalListeners.clear();
-        this.stateListenerRegistered = false;
 
         this.whenReady((channel) => {
             channel.unsubscribe();
             channel.off();
+
+            // Reset here rather than synchronously above: `unsubscribe()` can
+            // be called while the first `subscribe()` is still pending, and
+            // that `subscribe()` would then set the flag *after* a synchronous
+            // reset — leaving the flag claiming a listener `off()` just removed,
+            // so a later `subscribe()` would never register one again.
+            this.stateListenerRegistered = false;
 
             return channel.detach();
         });
@@ -313,6 +339,14 @@ export class AblyChannel extends Channel {
         if (change.current === "attached") {
             this.subscribedCallbacks.forEach((callback) => callback());
         }
+
+        if (!change.reason && change.current !== "failed") {
+            return;
+        }
+
+        // Claim the failure before the matching `attach()` rejection lands, so
+        // it is reported (or suppressed by the hook) exactly once.
+        this.failureReportedByState = true;
 
         if (change.current === "failed" && this.onChannelFailed(change)) {
             return;

@@ -83,6 +83,36 @@ function setup(
     };
 }
 
+/** A subclass that records the failures handed to the hook, and claims them. */
+class RecordingChannel extends AblyChannel {
+    readonly failures: ChannelStateChange[] = [];
+
+    protected onChannelFailed(change: ChannelStateChange): boolean {
+        this.failures.push(change);
+
+        return true;
+    }
+}
+
+function setupRecording(): {
+    realtime: MockRealtime;
+    channel: RecordingChannel;
+    underlying: () => MockChannel;
+} {
+    const realtime = createMockRealtime();
+    const channel = new RecordingChannel(
+        realtime as unknown as Realtime,
+        NAME,
+        echoOptions(),
+        {
+            ensureCapability: vi.fn().mockResolvedValue(undefined),
+            presenceInfo: () => undefined,
+        } as unknown as TokenManager,
+    );
+
+    return { realtime, channel, underlying: () => realtime.channels.all[NAME] };
+}
+
 /** Let `subscribe()` finish and every listener registration chained on it apply. */
 async function settle(channel: AblyChannel): Promise<void> {
     await channel.ready;
@@ -374,19 +404,22 @@ describe("AblyChannel", () => {
             channel.subscribed(callback);
             await settle(channel);
 
+            // The attach itself transitions the channel to `attached`.
+            expect(callback).toHaveBeenCalledTimes(1);
+
             underlying().emitStateChange({
                 current: "attached",
                 previous: "attaching",
             });
 
-            expect(callback).toHaveBeenCalledTimes(1);
+            expect(callback).toHaveBeenCalledTimes(2);
 
             underlying().emitStateChange({
                 current: "detached",
                 previous: "attached",
             });
 
-            expect(callback).toHaveBeenCalledTimes(1);
+            expect(callback).toHaveBeenCalledTimes(2);
         });
 
         it("registers exactly one state listener even when subscribe runs again", async () => {
@@ -398,10 +431,13 @@ describe("AblyChannel", () => {
 
             await channel.subscribe();
 
+            // One call per attach; a duplicate listener would double each one.
+            expect(callback).toHaveBeenCalledTimes(2);
+
             underlying().emitStateChange({ current: "attached" });
 
             expect(underlying().on).toHaveBeenCalledTimes(1);
-            expect(callback).toHaveBeenCalledTimes(1);
+            expect(callback).toHaveBeenCalledTimes(3);
         });
 
         it("fires error callbacks when a state change carries a reason", async () => {
@@ -476,62 +512,76 @@ describe("AblyChannel", () => {
             expect(rejections).toEqual([]);
         });
 
-        it("routes an attach rejection to error callbacks", async () => {
+        it("routes an attach rejection that never became a state change to error callbacks", async () => {
             const failure = new Error("attach refused");
             const { channel, realtime } = setup();
             const callback = vi.fn();
 
-            // `subscribe()` is still suspended on its first await, so the ably
-            // channel does not exist yet: create it here so its attach can be
-            // made to fail before `subscribe()` gets hold of it.
+            // A connection-level attach rejection: no channel state change
+            // accompanies it, so `subscribe()` owns the reporting. (The ably
+            // channel does not exist yet — `subscribe()` is still suspended on
+            // its first await — so it is created here first.)
             realtime.channels.get(NAME).attach.mockRejectedValueOnce(failure);
             channel.error(callback);
 
             await settle(channel);
 
+            expect(callback).toHaveBeenCalledTimes(1);
             expect(callback).toHaveBeenCalledWith(failure);
+        });
+
+        it("reports a failure that both changes state and rejects the attach only once", async () => {
+            const reason = { code: 40160, message: "not permitted" };
+            const { channel, realtime } = setup();
+            const callback = vi.fn();
+
+            realtime.channels.get(NAME).failAttach(reason);
+            channel.error(callback);
+
+            await settle(channel);
+
+            expect(callback).toHaveBeenCalledTimes(1);
+            expect(callback).toHaveBeenCalledWith(reason);
         });
     });
 
     describe("onChannelFailed", () => {
+        it("lets the hook claim a failure that also rejects the attach", async () => {
+            const reason = { code: 40160, message: "not permitted" };
+            const { channel, realtime } = setupRecording();
+            const callback = vi.fn();
+
+            realtime.channels.get(NAME).failAttach(reason);
+            channel.error(callback);
+
+            await settle(channel);
+
+            expect(channel.failures).toEqual([
+                { current: "failed", previous: "attaching", reason },
+            ]);
+            // Claimed by the hook: neither the state listener nor the attach
+            // rejection surfaces it, and nothing is buffered for replay.
+            expect(callback).not.toHaveBeenCalled();
+        });
+
         it("hands failures to the subclass hook, which can claim them", async () => {
-            const failures: ChannelStateChange[] = [];
-
-            class RecoveringChannel extends AblyChannel {
-                protected onChannelFailed(change: ChannelStateChange): boolean {
-                    failures.push(change);
-
-                    return true;
-                }
-            }
-
-            const realtime = createMockRealtime();
-            const channel = new RecoveringChannel(
-                realtime as unknown as Realtime,
-                NAME,
-                echoOptions(),
-                {
-                    ensureCapability: vi.fn().mockResolvedValue(undefined),
-                    presenceInfo: () => undefined,
-                } as unknown as TokenManager,
-            );
+            const { channel, underlying } = setupRecording();
             const callback = vi.fn();
 
             channel.error(callback);
             await settle(channel);
 
-            const underlying = realtime.channels.all[NAME];
             const reason = { code: 40160, message: "not permitted" };
 
-            underlying.emitStateChange({ current: "suspended", reason });
+            underlying().emitStateChange({ current: "suspended", reason });
 
-            expect(failures).toEqual([]);
+            expect(channel.failures).toEqual([]);
             expect(callback).toHaveBeenCalledTimes(1);
 
-            underlying.emitStateChange({ current: "failed", reason });
+            underlying().emitStateChange({ current: "failed", reason });
 
             // Claimed by the subclass, so it is not surfaced a second time.
-            expect(failures).toEqual([{ current: "failed", reason }]);
+            expect(channel.failures).toEqual([{ current: "failed", reason }]);
             expect(callback).toHaveBeenCalledTimes(1);
         });
     });
@@ -547,6 +597,32 @@ describe("AblyChannel", () => {
             expect(underlying().unsubscribe).toHaveBeenCalledWith();
             expect(underlying().off).toHaveBeenCalled();
             expect(underlying().detach).toHaveBeenCalled();
+        });
+
+        it("leaves the state listener re-registerable when it races a pending subscribe", async () => {
+            const gate = deferred<void>();
+            const { channel, underlying } = setup({
+                ensureCapability: vi.fn().mockReturnValue(gate.promise),
+            });
+            const callback = vi.fn();
+
+            channel.subscribed(callback);
+            // Teardown queued while `subscribe()` still waits for its token: it
+            // runs after the listener is registered, so the bookkeeping has to
+            // follow the `off()`, not the call to `unsubscribe()`.
+            channel.unsubscribe();
+
+            gate.resolve();
+            await settle(channel);
+
+            callback.mockClear();
+            await channel.subscribe();
+
+            expect(callback).toHaveBeenCalledTimes(1);
+
+            underlying().emitStateChange({ current: "attached" });
+
+            expect(callback).toHaveBeenCalledTimes(2);
         });
     });
 
