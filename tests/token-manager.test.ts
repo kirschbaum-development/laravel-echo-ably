@@ -1,4 +1,4 @@
-import type { Realtime, TokenDetails } from "ably";
+import type { ClientOptions, ErrorInfo, Realtime, TokenDetails } from "ably";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TokenManagerEchoOptions } from "../src/auth/token-manager";
 import { TokenManager } from "../src/auth/token-manager";
@@ -16,7 +16,7 @@ const ECHO_OPTIONS: TokenManagerEchoOptions = {
 type FetchFn = (input: string, init: RequestInit) => Promise<Response>;
 type FetchArgs = Parameters<FetchFn>;
 type AuthCallbackFn = (
-    error: unknown,
+    error: ErrorInfo | string | null,
     tokenDetails: TokenDetails | null,
 ) => void;
 
@@ -37,17 +37,38 @@ function jsonResponse(body: unknown, status: number = 200): Response {
     return new Response(JSON.stringify(body), { status });
 }
 
-/** Stub `fetch` to hand back `responses` in order, and return the mock. */
-function stubFetch(...responses: Response[]) {
+/**
+ * Stub `fetch` to hand back `responses` in order, and return the mock. A
+ * response may be a pending promise, which keeps that request in flight.
+ */
+function stubFetch(...responses: Array<Response | Promise<Response>>) {
     const fetchMock = vi.fn<FetchFn>();
 
     for (const response of responses) {
-        fetchMock.mockResolvedValueOnce(response);
+        fetchMock.mockReturnValueOnce(Promise.resolve(response));
     }
 
     vi.stubGlobal("fetch", fetchMock);
 
     return fetchMock;
+}
+
+/** Let the queued token request reach `fetch` without resolving it. */
+function flushQueue(): Promise<void> {
+    return Promise.resolve();
+}
+
+/** A response that stays in flight until `resolve` is called. */
+function deferredResponse(): {
+    response: Promise<Response>;
+    resolve: (response: Response) => void;
+} {
+    let resolve: (response: Response) => void = () => undefined;
+    const response = new Promise<Response>((res) => {
+        resolve = res;
+    });
+
+    return { response, resolve: (value) => resolve(value) };
 }
 
 function requestBody(call: FetchArgs): {
@@ -391,8 +412,24 @@ describe("authCallback", () => {
 
         const [error, details] = callback.mock.calls[0];
 
-        expect(error).toBeInstanceOf(Error);
+        // ably-js accepts `ErrorInfo | string | null` here; a plain `Error` is
+        // not in that union, so the reason travels as a string.
+        expect(typeof error).toBe("string");
+        expect(error).toContain("subscribe to a channel");
         expect(details).toBeNull();
+    });
+
+    it("stays assignable to ably's ClientOptions.authCallback", () => {
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        // Compile-level guard: the connector wires this straight into
+        // ClientOptions, so a narrower signature here would only blow up at
+        // that call site. `tsc --noEmit` covers tests/, so this line is the
+        // assertion.
+        const wired: NonNullable<ClientOptions["authCallback"]> =
+            manager.authCallback;
+
+        expect(wired).toBe(manager.authCallback);
     });
 });
 
@@ -416,5 +453,68 @@ describe("reset", () => {
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(requestBody(fetchMock.mock.calls[1]).token).toBeNull();
         expect(manager.currentToken()).toBe(second);
+    });
+
+    it("discards a token that arrives after a reset", async () => {
+        // Logout mid-flight: the reply belongs to the previous session and must
+        // neither be cached nor pushed onto the live connection.
+        const stale = token({ "private:a": ["*"] });
+        const fresh = token({ "private:a": ["*"] }, 7200);
+        const inFlight = deferredResponse();
+        const fetchMock = stubFetch(
+            inFlight.response,
+            jsonResponse({ token: fresh }),
+        );
+        const { client, authorize } = fakeClient();
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+        manager.setClient(client);
+
+        const pending = manager.ensureCapability("private:a");
+        await flushQueue();
+
+        // Guard the setup: the request has to be genuinely out before the reset
+        // for this test to be about what it claims.
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        manager.reset();
+        inFlight.resolve(jsonResponse({ token: stale }));
+        await pending;
+
+        expect(manager.currentToken()).toBeNull();
+        expect(authorize).not.toHaveBeenCalled();
+
+        await manager.ensureCapability("private:a");
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(requestBody(fetchMock.mock.calls[1]).token).toBeNull();
+        expect(manager.currentToken()).toBe(fresh);
+        expect(authorize).toHaveBeenCalledWith(undefined, { token: fresh });
+    });
+
+    it("still serves a request that was queued when the reset happened", async () => {
+        // Only requests already in flight are invalidated: one still waiting its
+        // turn simply starts fresh, or its caller would attach with no token.
+        const stale = token({ "private:a": ["*"] });
+        const fresh = token({ "private:b": ["*"] });
+        const inFlight = deferredResponse();
+        const fetchMock = stubFetch(
+            inFlight.response,
+            jsonResponse({ token: fresh }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        const first = manager.ensureCapability("private:a");
+        const second = manager.ensureCapability("private:b");
+        await flushQueue();
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        manager.reset();
+        inFlight.resolve(jsonResponse({ token: stale }));
+        await Promise.all([first, second]);
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(requestBody(fetchMock.mock.calls[1]).token).toBeNull();
+        expect(manager.currentToken()).toBe(fresh);
     });
 });

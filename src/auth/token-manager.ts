@@ -1,4 +1,4 @@
-import type { Realtime, TokenDetails } from "ably";
+import type { ErrorInfo, Realtime, TokenDetails } from "ably";
 import type { AblyDriverOptions, TokenResponse } from "../types";
 import { isGuarded } from "../util/channel-name";
 import type { ParsedJwt } from "./jwt";
@@ -30,6 +30,8 @@ export class TokenManager {
     private client: Realtime | null = null;
     private queue: Promise<unknown> = Promise.resolve();
     private info = new Map<string, unknown>();
+    /** Bumped by `reset()`; requests started under an older value are stale. */
+    private generation = 0;
 
     constructor(
         echoOptions: TokenManagerEchoOptions,
@@ -57,6 +59,7 @@ export class TokenManager {
     reset(): void {
         this.token = null;
         this.parsed = null;
+        this.generation += 1;
     }
 
     /**
@@ -80,10 +83,21 @@ export class TokenManager {
                 return;
             }
 
+            // Captured as the request goes out, not when it was queued: a
+            // request still waiting its turn should start fresh under the
+            // current session rather than be discarded with it.
+            const generation = this.generation;
             const response = await this.requestToken(channelName);
             // Parse before storing: a malformed token must leave the previous
             // one in place rather than half-replace it.
             const parsed = parseJwt(response.token);
+
+            // A reset() landed while this was in flight (logout, 40102): the
+            // reply belongs to the old session, so it is neither cached nor
+            // pushed onto the connection.
+            if (generation !== this.generation) {
+                return;
+            }
 
             this.token = response.token;
             this.parsed = parsed;
@@ -108,17 +122,21 @@ export class TokenManager {
 
     /**
      * ably-js v2 auth callback; wire into `ClientOptions.authCallback`. Bound as
-     * a field because ably-js calls it detached from the manager.
+     * a field because ably-js calls it detached from the manager, and typed to
+     * stay assignable to `ClientOptions["authCallback"]` — hence the error
+     * union ably declares, which is why the failure reason is a plain string
+     * rather than an `Error`.
      */
     authCallback = (
         _tokenParams: unknown,
-        callback: (error: unknown, tokenDetails: TokenDetails | null) => void,
+        callback: (
+            error: ErrorInfo | string | null,
+            tokenDetails: TokenDetails | null,
+        ) => void,
     ): void => {
         if (!this.token) {
             callback(
-                new Error(
-                    "No Ably token available yet: subscribe to a channel before authenticating.",
-                ),
+                "No Ably token available yet: subscribe to a channel before authenticating.",
                 null,
             );
 
