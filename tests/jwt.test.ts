@@ -47,6 +47,14 @@ describe("parseJwt", () => {
         expect(() => parseJwt("not-a-jwt")).toThrow("Invalid JWT");
         expect(() => parseJwt("a.###.c")).toThrow("Invalid JWT");
     });
+
+    it("throws when the capability claim is not JSON", () => {
+        expect(() =>
+            parseJwt(
+                makeJwt({ iat: 1, exp: 2, "x-ably-capability": "not json" }),
+            ),
+        ).toThrow("Invalid JWT");
+    });
 });
 
 describe("toTokenDetails", () => {

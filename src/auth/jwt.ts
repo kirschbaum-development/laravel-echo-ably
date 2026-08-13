@@ -40,24 +40,31 @@ export function parseJwt(jwt: string): ParsedJwt {
     }
 
     let payload: Record<string, unknown>;
+    let capability: Record<string, string[]>;
 
+    // Both decodes are guarded: a structurally valid JWT carrying a non-JSON
+    // capability claim is just as malformed as an undecodable payload, and
+    // callers should only ever have to catch one kind of error.
     try {
         payload = decodeSegment(segments[1]);
+
+        const capabilityClaim = payload["x-ably-capability"];
+
+        capability =
+            typeof capabilityClaim === "string"
+                ? (JSON.parse(capabilityClaim) as Record<string, string[]>)
+                : {};
     } catch {
         throw new Error("Invalid JWT");
     }
 
     const clientId = payload["x-ably-clientId"];
-    const capability = payload["x-ably-capability"];
 
     return {
         clientId: typeof clientId === "string" ? clientId : null,
         issued: typeof payload.iat === "number" ? payload.iat * 1000 : 0,
         expires: typeof payload.exp === "number" ? payload.exp * 1000 : 0,
-        capability:
-            typeof capability === "string"
-                ? (JSON.parse(capability) as Record<string, string[]>)
-                : {},
+        capability,
     };
 }
 
