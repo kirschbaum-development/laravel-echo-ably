@@ -74,7 +74,9 @@ docs/superpowers/specs/         // this document
 .github/workflows/ci.yml        // lint + typecheck + test + build
 ```
 
-Tooling mirrors laravel/echo 2.x: Vite library build (ESM + IIFE), `vite-plugin-dts`,
+Tooling mirrors laravel/echo 2.x: Vite library build (ESM + type declarations;
+no IIFE build — consumers need `laravel-echo`'s named exports, which its IIFE
+global does not expose), `vite-plugin-dts`,
 Vitest, ESLint + Prettier, TypeScript strict, Node >= 20, MIT license.
 
 ## Public API
