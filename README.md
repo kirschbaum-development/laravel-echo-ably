@@ -11,7 +11,7 @@ This package is neither: it is a standalone connector that plugs into Echo 2.x's
 
 ## Requirements
 
-- `laravel-echo` ^2.0 and `ably` ^2.0 (both peer dependencies)
+- `laravel-echo` ^2.3.0 and `ably` ^2.0 (both peer dependencies) — 2.3 is where Echo started exporting `ConnectionStatus`, which this package's types reference
 - Node 20+ for the build tooling; the package itself targets the browser
 - Laravel with [`ably/laravel-broadcaster`](https://github.com/ably/laravel-broadcaster) — the server side is **required**, because the driver authenticates with the Ably JWTs that package signs
 
@@ -111,7 +111,7 @@ new Echo({
 
 ### `clientOptions`
 
-The driver builds its client with `useTokenAuth: true`, `queryTime: true`, `echoMessages: false` and an `agents` entry, then merges your `clientOptions` over them. The `authCallback` is applied last and is always the driver's own — the token lifecycle (capability upgrades, the 40160 retry, the 40102 recovery) runs through it. If you need a different auth mechanism, supply a whole `client` instead.
+The driver builds its client with `useTokenAuth: true`, `queryTime: true`, `echoMessages: false` and an `agents` entry, then merges your `clientOptions` over them. The `authCallback` is applied last and is always the driver's own — the token lifecycle (capability upgrades, renewal at expiry, the 40160 retry, the 40102 recovery) runs through it. If you need a different auth mechanism, supply a whole `client` instead.
 
 ```ts
 ably: {
@@ -217,6 +217,18 @@ new Echo({
 });
 ```
 
+That static token has an expiry cliff: it dies at its TTL and nothing renews it. The driver's auth callback renews by asking `/broadcasting/auth` for the last channel it was granted capability for, and a public-only connection never made such a request — so its token cache is empty and there is nothing to renew from. When the token expires the connection is left without a credential. Tracked as [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
+
+For anything longer-lived than a page view, hand the driver a client that can authenticate itself instead — `authUrl` (or a key, server-side only) gives ably-js its own renewal path:
+
+```ts
+import * as Ably from "ably";
+
+const client = new Ably.Realtime({ authUrl: "/ably/token" });
+
+new Echo({ broadcaster: AblyConnector, ably: { client } });
+```
+
 **The first connection reports one failure.** Echo opens the connection as soon as it is constructed, which is before any channel has fetched a token. `ably-js` asks for one, is told there is none yet, and reports a `disconnected` (80019 / 40170) — then connects as soon as the first channel's token arrives. Subscribers to `onConnectionChange` see a brief `reconnecting` before `connected`.
 
 **`whisper()` takes a plain object.** Its parameter is `Record<string, unknown>`. An object literal is fine; a payload typed with an `interface` is not assignable to it, so declare those with a type alias:
@@ -229,7 +241,7 @@ const payload: TypingPayload = { name: user.name };
 Echo.private("chat").whisper("typing", payload);
 ```
 
-**A whisper on a channel that failed to subscribe is dropped.** Silently, on purpose: the subscribe failure was already reported to that channel's `error()` callbacks, and re-reporting it as a publish failure would say the same thing twice.
+**A whisper sent before the ably channel exists is dropped.** If the subscribe failed at the auth step — a rejected `/broadcasting/auth` request — there is no ably channel to publish on, so the whisper is discarded silently: the failure already reached that channel's `error()` callbacks, and re-reporting it as a publish failure would say the same thing twice. A whisper on a channel whose _attach_ failed is different: the channel object exists, the publish is attempted, and ably's rejection is delivered to `error()` like any other publish failure.
 
 **`Echo.disconnect()` reaches channel `error()` callbacks.** Closing the connection detaches its channels with an 80017 (`Connection closed`) `ErrorInfo`. It is the expected outcome of a deliberate close, not a fault.
 
@@ -245,14 +257,14 @@ Echo.private("orders").error((error) => {
 });
 ```
 
-| Code            | Meaning                                                                                                                           | What the driver does                                                                                                                                                                                                              |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `40102`         | Incompatible credentials — the connection's client id no longer matches the token's, which is what a login or a logout looks like | Drops the cached token, reconnects and re-subscribes every channel. Once per connection cycle, re-armed by the next successful connection.                                                                                        |
-| `40140`–`40142` | Token not accepted, revoked or expired                                                                                            | `ably-js` re-invokes the driver's auth callback, which replays the token it holds; a token that has genuinely expired is replaced on the next subscribe, where the capability check refuses anything within 30 seconds of expiry. |
-| `40160`         | The token does not grant this channel                                                                                             | Private and presence channels force a token upgrade and re-attach, once. A second consecutive rejection reaches `error()`.                                                                                                        |
-| `40170`/`80019` | Your auth endpoint or `requestTokenFn` failed                                                                                     | Surfaces as a connection error. Expected once on the very first connection — see the note above.                                                                                                                                  |
-| `80016`         | The connection was replaced by a newer one                                                                                        | Handled inside `ably-js`; no driver action.                                                                                                                                                                                       |
-| `80017`         | Connection closed                                                                                                                 | Delivered to channel `error()` callbacks after `Echo.disconnect()`. Expected.                                                                                                                                                     |
+| Code            | Meaning                                                                                                                           | What the driver does                                                                                                                                                                                                                                                                                                     |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `40102`         | Incompatible credentials — the connection's client id no longer matches the token's, which is what a login or a logout looks like | Drops the cached token, reconnects and re-subscribes every channel. Once per connection cycle, re-armed by the next successful connection. Implemented and unit-tested against a mocked client; verification against live Ably is tracked in [#5](https://github.com/kirschbaum-development/laravel-echo-ably/issues/5). |
+| `40140`–`40142` | Token not accepted, revoked or expired                                                                                            | `ably-js` re-invokes the driver's auth callback. A token with more than 30 seconds of life left is replayed as it is; one that is missing or inside that window is replaced by a fresh request to `authEndpoint` for the last channel capability was granted for.                                                        |
+| `40160`         | The token does not grant this channel                                                                                             | Private and presence channels force a token upgrade and re-attach, once per attach cycle: the retry is re-armed by every successful attach, so a channel that had been working gets a silent retry of its own. Two rejections in a row reach `error()`.                                                                  |
+| `40170`/`80019` | Your auth endpoint or `requestTokenFn` failed                                                                                     | Surfaces as a connection error. Expected once on the very first connection — see the note above.                                                                                                                                                                                                                         |
+| `80016`         | The connection was replaced by a newer one                                                                                        | Handled inside `ably-js`; no driver action.                                                                                                                                                                                                                                                                              |
+| `80017`         | Connection closed                                                                                                                 | Delivered to channel `error()` callbacks after `Echo.disconnect()`. Expected.                                                                                                                                                                                                                                            |
 
 Failures during subscription — a rejected auth request, a refused attach — are routed to the channel's `error()` callbacks rather than thrown, and the most recent one is replayed to callbacks registered after it, so an `error()` handler added on the same tick as the channel still sees it.
 
@@ -290,7 +302,7 @@ The built-in broadcaster is `pusher-js` against Ably's Pusher-protocol adapter. 
 
 ### From `@ably/laravel-echo`
 
-- Swap the dependency (`@ably/laravel-echo` and `ably@1.x` out, this package, `laravel-echo` ^2 and `ably` ^2 in), and drop the `window.Ably` global — the driver imports `ably` itself.
+- Swap the dependency (`@ably/laravel-echo` and `ably@1.x` out, this package, `laravel-echo` ^2.3 and `ably` ^2 in), and drop the `window.Ably` global — the driver imports `ably` itself.
 - `broadcaster: "ably"` becomes `broadcaster: AblyConnector`.
 - **Names are Echo-style everywhere.** No `private:` or `presence:` prefixes in application code, including `leaveChannel()`. Pusher-style (`private-orders`) and Ably-style (`private:orders`) names are both still accepted there, so existing calls keep working.
 - **`here()` fires on subscription success**, with the member list, and not again as members come and go. Anything that relied on `here()` re-firing for membership changes belongs in `joining()` / `leaving()`.
@@ -302,7 +314,7 @@ The built-in broadcaster is `pusher-js` against Ably's Pusher-protocol adapter. 
 - **Encrypted private channels.** `Echo.encryptedPrivate()` throws for any non-Pusher connector — Echo's core gates it with an `instanceof` check on its own connectors, so no third-party driver can implement it today.
 - **Typed hooks.** `configureEcho({broadcaster: AblyConnector})` needs a suppression until the upstream `laravel/echo` typing PRs land.
 - **A replay / `recovered` API.** Use `channelOptions` with `rewind` in the meantime.
-- **Connections that only ever use public channels.** Supply a token through `clientOptions` — see the note above.
+- **Connections that only ever use public channels.** Supply a token through `clientOptions`, or a self-authenticating `client` — see the note above, and [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
 
 Progress and requests: [github.com/kirschbaum-development/laravel-echo-ably/issues](https://github.com/kirschbaum-development/laravel-echo-ably/issues).
 
