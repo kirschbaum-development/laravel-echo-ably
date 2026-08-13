@@ -1,86 +1,19 @@
-import type { ChannelOptions, ChannelStateChange, Realtime } from "ably";
-import type { Mock } from "vitest";
+import type { ChannelOptions, ChannelStateChange } from "ably";
 import { describe, expect, it, vi } from "vitest";
-import type { TokenManager } from "../src/auth/token-manager";
 import { AblyChannel } from "../src/channels/ably-channel";
-import type { EchoOptionsWithDefaults } from "../src/types";
-import type { MockChannel, MockRealtime } from "./mocks/ably";
-import { createMockRealtime } from "./mocks/ably";
+import type { ChannelHarness, ChannelOverrides } from "./helpers";
+import {
+    CHANNEL_NAME as NAME,
+    deferred,
+    echoOptions,
+    noopListener,
+    settle,
+    setupChannel,
+    withoutUnhandledRejections,
+} from "./helpers";
 
-/**
- * Node's rejection hook. Declared here because the package targets the browser,
- * so the tsconfig carries no node typings.
- */
-declare const process: {
-    on(event: string, listener: (reason: unknown) => void): void;
-    off(event: string, listener: (reason: unknown) => void): void;
-};
-
-const NAME = "private:orders";
-
-/** A listener whose calls do not matter. Bare `vi.fn()` is not a `CallableFunction`. */
-function noopListener(): Mock<() => void> {
-    return vi.fn(() => undefined);
-}
-
-/** Echo's resolved options bag, with the driver-specific slice merged in. */
-function echoOptions(
-    ably: Record<string, unknown> = {},
-): EchoOptionsWithDefaults {
-    return {
-        broadcaster: "ably",
-        auth: { headers: {} },
-        authEndpoint: "/broadcasting/auth",
-        userAuthentication: {
-            endpoint: "/broadcasting/user-auth",
-            headers: {},
-        },
-        csrfToken: null,
-        bearerToken: null,
-        host: null,
-        key: null,
-        namespace: "App.Events",
-        ably,
-    };
-}
-
-type Harness = {
-    realtime: MockRealtime;
-    channel: AblyChannel;
-    ensureCapability: Mock;
-    /** The underlying mock channel; only present once `subscribe()` got that far. */
-    underlying: () => MockChannel;
-};
-
-function setup(
-    overrides: {
-        ensureCapability?: Mock;
-        options?: EchoOptionsWithDefaults;
-        name?: string;
-    } = {},
-): Harness {
-    const name = overrides.name ?? NAME;
-    const ensureCapability =
-        overrides.ensureCapability ?? vi.fn().mockResolvedValue(undefined);
-    const tokenManager = {
-        ensureCapability,
-        presenceInfo: () => undefined,
-    } as unknown as TokenManager;
-    const realtime = createMockRealtime();
-
-    const channel = new AblyChannel(
-        realtime as unknown as Realtime,
-        name,
-        overrides.options ?? echoOptions(),
-        tokenManager,
-    );
-
-    return {
-        realtime,
-        channel,
-        ensureCapability,
-        underlying: () => realtime.channels.all[name],
-    };
+function setup(overrides: ChannelOverrides = {}): ChannelHarness<AblyChannel> {
+    return setupChannel(AblyChannel, overrides);
 }
 
 /** A subclass that records the failures handed to the hook, and claims them. */
@@ -94,66 +27,8 @@ class RecordingChannel extends AblyChannel {
     }
 }
 
-function setupRecording(): {
-    realtime: MockRealtime;
-    channel: RecordingChannel;
-    underlying: () => MockChannel;
-} {
-    const realtime = createMockRealtime();
-    const channel = new RecordingChannel(
-        realtime as unknown as Realtime,
-        NAME,
-        echoOptions(),
-        {
-            ensureCapability: vi.fn().mockResolvedValue(undefined),
-            presenceInfo: () => undefined,
-        } as unknown as TokenManager,
-    );
-
-    return { realtime, channel, underlying: () => realtime.channels.all[NAME] };
-}
-
-/** Let `subscribe()` finish and every listener registration chained on it apply. */
-async function settle(channel: AblyChannel): Promise<void> {
-    await channel.ready;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-function deferred<T>(): {
-    promise: Promise<T>;
-    resolve: (value: T) => void;
-    reject: (reason: unknown) => void;
-} {
-    let resolve!: (value: T) => void;
-    let reject!: (reason: unknown) => void;
-    const promise = new Promise<T>((res, rej) => {
-        resolve = res;
-        reject = rej;
-    });
-
-    return { promise, resolve, reject };
-}
-
-/** Record anything Node would report as an unhandled promise rejection. */
-async function withoutUnhandledRejections(
-    body: () => Promise<void>,
-): Promise<unknown[]> {
-    const rejections: unknown[] = [];
-    const onRejection = (reason: unknown) => rejections.push(reason);
-
-    process.on("unhandledRejection", onRejection);
-
-    try {
-        await body();
-        // Two macrotask turns: Node reports unhandled rejections at the end of
-        // the turn in which the promise was rejected.
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        await new Promise((resolve) => setTimeout(resolve, 0));
-    } finally {
-        process.off("unhandledRejection", onRejection);
-    }
-
-    return rejections;
+function setupRecording(): ChannelHarness<RecordingChannel> {
+    return setupChannel(RecordingChannel);
 }
 
 describe("AblyChannel", () => {
