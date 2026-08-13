@@ -96,6 +96,15 @@ export class AblyConnector extends Connector<
     tokenManager!: TokenManager;
 
     /**
+     * Whether this connection cycle already spent its 40102 recovery. A
+     * mismatch that survives the recovery will survive it again, and retrying
+     * would be an unbounded connect → fail → re-auth loop against
+     * `/broadcasting/auth`. Cleared by a successful connection, so a later,
+     * unrelated identity change gets a recovery of its own.
+     */
+    private recoverySpent = false;
+
+    /**
      * Create a fresh Ably connection.
      */
     connect(): void {
@@ -107,6 +116,12 @@ export class AblyConnector extends Connector<
         this.tokenManager = new TokenManager(this.options, driverOptions);
         this.ably = driverOptions.client ?? this.createClient(driverOptions);
         this.tokenManager.setClient(this.ably);
+
+        this.ably.connection.on("connected", () => {
+            // A working connection closes the recovery cycle: whatever comes
+            // after it is a new problem, not the old one still failing.
+            this.recoverySpent = false;
+        });
 
         this.ably.connection.on("failed", (change: ConnectionStateChange) => {
             this.recoverFromClientIdMismatch(change);
@@ -132,6 +147,21 @@ export class AblyConnector extends Connector<
      */
     presenceChannel(name: string): AblyPresenceChannel {
         return this.resolveChannel(toPresence(name), AblyPresenceChannel);
+    }
+
+    /**
+     * Listen for an event on a channel instance.
+     *
+     * Not part of the abstract contract, but Echo's own `listen()` delegates
+     * straight to it, so a connector without it makes `echo.listen(...)` throw.
+     * Public-channel semantics, matching every other connector.
+     */
+    listen(
+        name: string,
+        event: string,
+        callback: CallableFunction,
+    ): AblyChannel {
+        return this.channel(name).listen(event, callback);
     }
 
     /**
@@ -284,11 +314,18 @@ export class AblyConnector extends Connector<
      * token that named the old identity is dropped, the connection reopened,
      * and every live channel re-subscribed under the identity the next token
      * carries.
+     *
+     * Once per connection cycle, the same way a private channel spends one
+     * silent retry on a capability rejection: a mismatch that comes straight
+     * back is left to stand as a failed connection, which is what
+     * `connectionStatus()` and `onConnectionChange` subscribers report.
      */
     private recoverFromClientIdMismatch(change: ConnectionStateChange): void {
-        if (change.reason?.code !== CLIENT_ID_MISMATCH) {
+        if (change.reason?.code !== CLIENT_ID_MISMATCH || this.recoverySpent) {
             return;
         }
+
+        this.recoverySpent = true;
 
         this.tokenManager.reset();
         this.ably.connect();

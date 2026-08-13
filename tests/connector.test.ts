@@ -65,6 +65,15 @@ function flush(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** The connection failing the way a login or a logout makes it fail. */
+function failWithMismatch(realtime: MockRealtime): void {
+    realtime.connection.emitStateChange({
+        current: "failed",
+        previous: "connected",
+        reason: { code: 40102, message: "client id mismatch" },
+    });
+}
+
 describe("AblyConnector", () => {
     beforeEach(() => {
         realtimeConstructor.mockReset();
@@ -239,6 +248,33 @@ describe("AblyConnector", () => {
                 "public:orders",
                 "private:orders",
             ]);
+        });
+    });
+
+    describe("listen", () => {
+        it("listens for the event on the public channel of that name", async () => {
+            const { realtime, connector } = setup();
+            const callback = vi.fn();
+
+            const channel = connector.listen(
+                "orders",
+                "OrderShipped",
+                callback,
+            );
+
+            // Echo delegates `echo.listen(...)` straight through to here, and
+            // the channel it hands back is the cached public one.
+            expect(channel).toBe(connector.channel("orders"));
+            expect(channel.name).toBe("public:orders");
+
+            await settle(channel);
+
+            realtime.channels.all["public:orders"].emitMessage({
+                name: "App\\Events\\OrderShipped",
+                data: { id: 1 },
+            });
+
+            expect(callback).toHaveBeenCalledWith({ id: 1 });
         });
     });
 
@@ -488,11 +524,7 @@ describe("AblyConnector", () => {
                 vi.spyOn(channel, "subscribe"),
             );
 
-            realtime.connection.emitStateChange({
-                current: "failed",
-                previous: "connected",
-                reason: { code: 40102, message: "client id mismatch" },
-            });
+            failWithMismatch(realtime);
 
             expect(reset).toHaveBeenCalledTimes(1);
             expect(realtime.connect).toHaveBeenCalledTimes(1);
@@ -566,17 +598,63 @@ describe("AblyConnector", () => {
             requestTokenFn.mockRejectedValue(failure);
 
             const rejections = await withoutUnhandledRejections(async () => {
-                realtime.connection.emitStateChange({
-                    current: "failed",
-                    previous: "connected",
-                    reason: { code: 40102, message: "client id mismatch" },
-                });
+                failWithMismatch(realtime);
 
                 await flush();
             });
 
             expect(error).toHaveBeenCalledWith(failure);
             expect(rejections).toEqual([]);
+        });
+
+        it("recovers once for a run of failures, not once per failure", async () => {
+            const { realtime, connector } = setup();
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            const reset = vi.spyOn(connector.tokenManager, "reset");
+            const subscribe = vi.spyOn(channel, "subscribe");
+
+            failWithMismatch(realtime);
+            failWithMismatch(realtime);
+            failWithMismatch(realtime);
+
+            // A mismatch that survives the recovery is not going to be fixed by
+            // running it again: the connection stays failed, which is what
+            // connectionStatus() and onConnectionChange subscribers report.
+            expect(reset).toHaveBeenCalledTimes(1);
+            expect(realtime.connect).toHaveBeenCalledTimes(1);
+            expect(subscribe).toHaveBeenCalledTimes(1);
+
+            await flush();
+        });
+
+        it("recovers again once the connection has come back", async () => {
+            const { realtime, connector } = setup();
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            const reset = vi.spyOn(connector.tokenManager, "reset");
+            const subscribe = vi.spyOn(channel, "subscribe");
+
+            failWithMismatch(realtime);
+
+            realtime.connection.emitStateChange({
+                current: "connected",
+                previous: "connecting",
+            });
+
+            // A later mismatch is a new identity change, not the same one
+            // failing again.
+            failWithMismatch(realtime);
+
+            expect(reset).toHaveBeenCalledTimes(2);
+            expect(realtime.connect).toHaveBeenCalledTimes(2);
+            expect(subscribe).toHaveBeenCalledTimes(2);
+
+            await flush();
         });
     });
 
@@ -616,6 +694,33 @@ describe("AblyConnector", () => {
             expect(
                 realtime.channels.all["private:orders"].attach,
             ).toHaveBeenCalled();
+        });
+
+        it("delivers echo.listen() through to a public channel", async () => {
+            const realtime = createMockRealtime();
+            const echo = new Echo({
+                broadcaster: AblyConnector,
+                ably: { client: realtime },
+            });
+            const callback = vi.fn();
+
+            const channel = echo.listen(
+                "orders",
+                "OrderShipped",
+                callback,
+            ) as AblyChannel;
+
+            expect(channel).toBeInstanceOf(AblyChannel);
+            expect(channel.name).toBe("public:orders");
+
+            await settle(channel);
+
+            realtime.channels.all["public:orders"].emitMessage({
+                name: "App\\Events\\OrderShipped",
+                data: { id: 7 },
+            });
+
+            expect(callback).toHaveBeenCalledWith({ id: 7 });
         });
     });
 });
