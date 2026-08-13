@@ -1,4 +1,10 @@
-import type { ClientOptions, ErrorInfo, Realtime, TokenDetails } from "ably";
+import type {
+    AuthOptions,
+    ClientOptions,
+    ErrorInfo,
+    Realtime,
+    TokenDetails,
+} from "ably";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TokenManagerEchoOptions } from "../src/auth/token-manager";
 import { TokenManager } from "../src/auth/token-manager";
@@ -100,7 +106,14 @@ function callAuthCallback(
 
 /** Minimal stand-in for the bits of `Realtime` the manager touches. */
 function fakeClient() {
-    const authorize = vi.fn(async () => undefined);
+    // Typed with ably's own parameters so a test can read back the auth options
+    // the push carried, not just that it happened.
+    const authorize = vi.fn(
+        async (
+            _tokenParams?: unknown,
+            _authOptions?: AuthOptions,
+        ): Promise<undefined> => undefined,
+    );
 
     return {
         client: { auth: { authorize } } as unknown as Realtime,
@@ -156,7 +169,34 @@ describe("ensureCapability", () => {
         });
 
         expect(manager.currentToken()).toBe(jwt);
-        expect(authorize).toHaveBeenCalledWith(undefined, { token: jwt });
+        expect(authorize).toHaveBeenCalledWith(undefined, {
+            token: jwt,
+            authCallback: manager.authCallback,
+        });
+    });
+
+    it("keeps its own auth callback registered on every push to the client", async () => {
+        // ably *replaces* the stored auth options with whatever `authorize` is
+        // handed — `Auth._saveTokenOptions` ends in a flat assignment, and the
+        // typings say as much — so a push carrying only the token unregisters
+        // the callback for good. ably then has no way to request the next
+        // token (40171), and every renewal path in this class becomes
+        // unreachable on a real client.
+        const jwt = token({ "private:a": ["*"] });
+        stubFetch(jsonResponse({ token: jwt }));
+        const { client, authorize } = fakeClient();
+
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+        manager.setClient(client);
+        await manager.ensureCapability("private:a");
+
+        const [tokenParams, authOptions] = authorize.mock.calls[0];
+
+        expect(tokenParams).toBeUndefined();
+        expect(authOptions?.token).toBe(jwt);
+        // Identity, not shape: ably keeps whatever object it is given, and only
+        // this exact function knows how to renew.
+        expect(authOptions?.authCallback).toBe(manager.authCallback);
     });
 
     it("skips the request when the cached token already covers the channel", async () => {
@@ -630,7 +670,10 @@ describe("reset", () => {
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(requestBody(fetchMock.mock.calls[1]).token).toBeNull();
         expect(manager.currentToken()).toBe(fresh);
-        expect(authorize).toHaveBeenCalledWith(undefined, { token: fresh });
+        expect(authorize).toHaveBeenCalledWith(undefined, {
+            token: fresh,
+            authCallback: manager.authCallback,
+        });
     });
 
     it("still serves a request that was queued when the reset happened", async () => {

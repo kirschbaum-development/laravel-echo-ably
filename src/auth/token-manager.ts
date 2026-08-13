@@ -141,6 +141,12 @@ export class TokenManager {
             if (opts.push && this.client) {
                 await this.client.auth.authorize(undefined, {
                     token: response.token,
+                    // Carried deliberately: ably *replaces* its stored auth
+                    // options with whatever it is handed here rather than
+                    // merging them, so a push without this would unregister
+                    // the callback and leave the client with no way to request
+                    // its next token (40171) — taking renewal with it.
+                    authCallback: this.authCallback,
                 });
             }
         });

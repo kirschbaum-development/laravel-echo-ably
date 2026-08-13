@@ -135,7 +135,9 @@ const client = new BaseRealtime({
 new Echo({ broadcaster: AblyConnector, ably: { client } });
 ```
 
-The driver uses the instance as it is — including its auth configuration — and still routes capability upgrades through it. This is the escape hatch for the modular build (smaller bundles) and for auth stories the driver does not model.
+The driver uses the instance as it is — transport, plugins, auth configuration — and routes capability upgrades through it. One caveat worth knowing: the first private or presence subscribe hands the client a token signed by `ably/laravel-broadcaster`, since that is the only thing carrying Laravel's channel capability, and `auth.authorize()` _replaces_ ably's stored auth options rather than merging them. The driver includes its own `authCallback` in that call, so token renewal keeps working and goes to `authEndpoint` from then on — but the `authUrl` or key the instance was built with is no longer consulted. A client that only ever serves public channels never reaches that point and keeps its own auth story intact.
+
+This is the escape hatch for the modular build (smaller bundles) and for auth stories the driver does not model.
 
 ### `requestTokenFn`
 
@@ -219,7 +221,7 @@ new Echo({
 
 That static token has an expiry cliff: it dies at its TTL and nothing renews it. The driver's auth callback renews by asking `/broadcasting/auth` for the last channel it was granted capability for, and a public-only connection never made such a request — so its token cache is empty and there is nothing to renew from. When the token expires the connection is left without a credential. Tracked as [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
 
-For anything longer-lived than a page view, hand the driver a client that can authenticate itself instead — `authUrl` (or a key, server-side only) gives ably-js its own renewal path:
+For anything longer-lived than a page view, hand the driver a client that can authenticate itself instead — `authUrl` (or a key, server-side only) gives ably-js its own renewal path, and a public-only app never triggers the driver's own token push, so that configuration stays in force:
 
 ```ts
 import * as Ably from "ably";
