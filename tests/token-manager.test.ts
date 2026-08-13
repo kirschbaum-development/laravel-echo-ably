@@ -81,6 +81,23 @@ function requestBody(call: FetchArgs): {
     };
 }
 
+/**
+ * Invoke the auth callback and resolve with whatever it hands back, whether it
+ * answers on the spot or after a renewal request.
+ */
+function callAuthCallback(
+    manager: TokenManager,
+): Promise<[ErrorInfo | string | null, TokenDetails | null]> {
+    return new Promise((resolve) => {
+        manager.authCallback({}, (error, details) =>
+            resolve([error, details] as [
+                ErrorInfo | string | null,
+                TokenDetails | null,
+            ]),
+        );
+    });
+}
+
 /** Minimal stand-in for the bits of `Realtime` the manager touches. */
 function fakeClient() {
     const authorize = vi.fn(async () => undefined);
@@ -377,9 +394,9 @@ describe("presenceInfo", () => {
 });
 
 describe("authCallback", () => {
-    it("hands ably the current token details", async () => {
+    it("replays the cached token, without an auth request, while it is fresh", async () => {
         const jwt = token({ "private:a": ["*"] });
-        stubFetch(jsonResponse({ token: jwt }));
+        const fetchMock = stubFetch(jsonResponse({ token: jwt }));
         const manager = new TokenManager(ECHO_OPTIONS, {});
 
         await manager.ensureCapability("private:a");
@@ -402,6 +419,68 @@ describe("authCallback", () => {
             expires: NOW + 3_600_000,
             capability: JSON.stringify({ "private:a": ["*"] }),
         });
+        // A token that is good for another hour is not worth a round trip.
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("requests a fresh token when the cached one is inside the expiry window", async () => {
+        // The renewal path an idle, listen-only connection depends on: nothing
+        // else asks for capability, so without this the connection loses
+        // realtime for good at the token's TTL.
+        const first = token({ "private:a": ["*"] }, 60);
+        const second = token({ "private:a": ["*"] }, 3600);
+        const fetchMock = stubFetch(
+            jsonResponse({ token: first }),
+            jsonResponse({ token: second }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("private:a");
+
+        // 29s of life left: inside the window, so the cached token is not worth
+        // offering ably.
+        vi.setSystemTime(NOW + 31_000);
+
+        const [error, details] = await callAuthCallback(manager);
+
+        expect(error).toBeNull();
+        expect(details?.token).toBe(second);
+
+        // Requested for the last channel a grant was actually made for, and
+        // carrying the old token so the server accretes onto its capability.
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(requestBody(fetchMock.mock.calls[1])).toEqual({
+            channel_name: "private:a",
+            token: first,
+        });
+        expect(manager.currentToken()).toBe(second);
+    });
+
+    it("renews for the last channel that was granted, not the last one asked for", async () => {
+        const first = token({ "private:a": ["*"] }, 60);
+        const second = token({ "private:a": ["*"], "private:b": ["*"] }, 60);
+        const third = token({ "private:a": ["*"], "private:b": ["*"] }, 3600);
+        const fetchMock = stubFetch(
+            jsonResponse({ token: first }),
+            jsonResponse({ token: second }),
+            jsonResponse({ token: third }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("private:a");
+        await manager.ensureCapability("private:b");
+        // Covered by the token already, so it grants nothing new and must not
+        // become what a renewal asks for.
+        await manager.ensureCapability("private:a");
+
+        vi.setSystemTime(NOW + 31_000);
+
+        await callAuthCallback(manager);
+
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(requestBody(fetchMock.mock.calls[2]).channel_name).toBe(
+            "private:b",
+        );
     });
 
     it("reports an error when no token has been fetched yet", () => {
@@ -417,6 +496,46 @@ describe("authCallback", () => {
         expect(typeof error).toBe("string");
         expect(error).toContain("subscribe to a channel");
         expect(details).toBeNull();
+    });
+
+    it("still errors when no guarded channel was ever requested", async () => {
+        // A public-only connection has no channel to renew for: there is
+        // nothing `/broadcasting/auth` could be asked to grant. Tracked as
+        // issue #4 rather than guessed at here.
+        const fetchMock = stubFetch();
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("public:orders");
+
+        const callback = vi.fn<AuthCallbackFn>();
+        manager.authCallback({}, callback);
+
+        const [error, details] = callback.mock.calls[0];
+
+        expect(typeof error).toBe("string");
+        expect(details).toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("reports a failed renewal to ably rather than an empty token", async () => {
+        const first = token({ "private:a": ["*"] }, 60);
+        stubFetch(
+            jsonResponse({ token: first }),
+            jsonResponse({ message: "Forbidden" }, 403),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("private:a");
+
+        vi.setSystemTime(NOW + 31_000);
+
+        const [error, details] = await callAuthCallback(manager);
+
+        expect(typeof error).toBe("string");
+        expect(String(error)).toContain("403");
+        expect(details).toBeNull();
+        // The token that could not be replaced is still the one on file.
+        expect(manager.currentToken()).toBe(first);
     });
 
     it("stays assignable to ably's ClientOptions.authCallback", () => {
@@ -453,6 +572,29 @@ describe("reset", () => {
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(requestBody(fetchMock.mock.calls[1]).token).toBeNull();
         expect(manager.currentToken()).toBe(second);
+    });
+
+    it("drops the presence info the old session's grants carried", async () => {
+        // The info is this user's presence payload. Keeping it past a logout
+        // would enter the next member under the previous one's data.
+        stubFetch(
+            jsonResponse({
+                token: token({ "presence:room": ["*"] }),
+                info: { id: 7, name: "Ada" },
+            }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("presence:room");
+
+        expect(manager.presenceInfo("presence:room")).toEqual({
+            id: 7,
+            name: "Ada",
+        });
+
+        manager.reset();
+
+        expect(manager.presenceInfo("presence:room")).toBeUndefined();
     });
 
     it("discards a token that arrives after a reset", async () => {

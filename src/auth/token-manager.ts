@@ -10,6 +10,10 @@ import { parseJwt, toTokenDetails } from "./jwt";
  */
 const EXPIRY_WINDOW_MS = 30_000;
 
+/** What ably is told when there is no token and no way to ask for one. */
+const NO_TOKEN =
+    "No Ably token available yet: subscribe to a channel before authenticating.";
+
 /** The slice of Echo's options the manager needs to reach `/broadcasting/auth`. */
 export type TokenManagerEchoOptions = {
     authEndpoint: string;
@@ -32,6 +36,15 @@ export class TokenManager {
     private info = new Map<string, unknown>();
     /** Bumped by `reset()`; requests started under an older value are stale. */
     private generation = 0;
+
+    /**
+     * The last guarded channel a token was actually granted for, and so the
+     * channel a renewal asks about: the server accretes each grant onto the
+     * token it is handed, so asking for the most recent one comes back with
+     * everything the expiring token carried. Survives `reset()` — it describes
+     * what this app subscribes to, not which session held the token.
+     */
+    private lastGrantedChannel: string | null = null;
 
     constructor(
         echoOptions: TokenManagerEchoOptions,
@@ -59,6 +72,9 @@ export class TokenManager {
     reset(): void {
         this.token = null;
         this.parsed = null;
+        // The presence payloads belong to the identity that just went away:
+        // keeping them would enter the next member under the old one's data.
+        this.info.clear();
         this.generation += 1;
     }
 
@@ -75,6 +91,21 @@ export class TokenManager {
             return Promise.resolve();
         }
 
+        return this.grant(channelName, { force: opts.force, push: true });
+    }
+
+    /**
+     * Queue a token request for `channelName` and apply what comes back.
+     *
+     * `push` decides whether the new token is also handed to the live
+     * connection: every caller but the auth callback needs that, and the auth
+     * callback does not, because ably-js applies whatever that callback
+     * resolves with.
+     */
+    private grant(
+        channelName: string,
+        opts: { force?: boolean; push: boolean },
+    ): Promise<void> {
         // Requests queue behind one another: the server accretes capability onto
         // the token it is handed, so overlapping requests would each drop the
         // other's grants.
@@ -101,12 +132,13 @@ export class TokenManager {
 
             this.token = response.token;
             this.parsed = parsed;
+            this.lastGrantedChannel = channelName;
 
             if (response.info !== undefined) {
                 this.info.set(channelName, response.info);
             }
 
-            if (this.client) {
+            if (opts.push && this.client) {
                 await this.client.auth.authorize(undefined, {
                     token: response.token,
                 });
@@ -126,6 +158,11 @@ export class TokenManager {
      * stay assignable to `ClientOptions["authCallback"]` — hence the error
      * union ably declares, which is why the failure reason is a plain string
      * rather than an `Error`.
+     *
+     * ably-js calls this whenever the connection needs a credential, including
+     * shortly before the current one expires — which is the only thing keeping
+     * an idle, listen-only connection alive, since nothing else there asks for
+     * capability again.
      */
     authCallback = (
         _tokenParams: unknown,
@@ -134,17 +171,68 @@ export class TokenManager {
             tokenDetails: TokenDetails | null,
         ) => void,
     ): void => {
-        if (!this.token) {
+        if (this.token && !this.expiresSoon()) {
+            callback(null, toTokenDetails(this.token));
+
+            return;
+        }
+
+        // Nothing guarded was ever subscribed to, so there is no channel to ask
+        // `/broadcasting/auth` about. A connection that only ever uses public
+        // channels needs a credential of its own (tracking issue #4).
+        if (!this.lastGrantedChannel) {
+            callback(NO_TOKEN, null);
+
+            return;
+        }
+
+        void this.renew(this.lastGrantedChannel, callback);
+    };
+
+    /**
+     * Fetch a replacement for the expiring token and hand it straight to ably,
+     * which applies whatever an auth callback resolves with — so this deliberately
+     * does not push it onto the connection a second time.
+     */
+    private async renew(
+        channelName: string,
+        callback: (
+            error: ErrorInfo | string | null,
+            tokenDetails: TokenDetails | null,
+        ) => void,
+    ): Promise<void> {
+        try {
+            await this.grant(channelName, { push: false });
+        } catch (error) {
+            // ably's callback signature takes `ErrorInfo | string`, and an
+            // `Error` is in neither, so the reason travels as its message.
             callback(
-                "No Ably token available yet: subscribe to a channel before authenticating.",
+                error instanceof Error ? error.message : String(error),
                 null,
             );
 
             return;
         }
 
+        // A reset() landing mid-renewal discards the reply, and a token that
+        // never arrived is not one to authenticate with.
+        if (!this.token) {
+            callback(NO_TOKEN, null);
+
+            return;
+        }
+
         callback(null, toTokenDetails(this.token));
-    };
+    }
+
+    /** Is the cached token gone, or too close to expiry to be worth offering? */
+    private expiresSoon(): boolean {
+        // A token with no `exp` claim parses to `expires: 0`, so it lands here
+        // and is never trusted.
+        return (
+            !this.parsed || this.parsed.expires - Date.now() < EXPIRY_WINDOW_MS
+        );
+    }
 
     /** Does the cached token grant `channelName` for long enough to use? */
     private covers(channelName: string): boolean {
@@ -152,9 +240,7 @@ export class TokenManager {
             return false;
         }
 
-        // A token with no `exp` claim parses to `expires: 0`, so it lands here
-        // and is never trusted.
-        if (this.parsed.expires - Date.now() < EXPIRY_WINDOW_MS) {
+        if (this.expiresSoon()) {
             return false;
         }
 
