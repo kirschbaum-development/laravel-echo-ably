@@ -288,8 +288,10 @@ describe("AblyPresenceChannel", () => {
     });
 
     describe("unsubscribe", () => {
-        it("leaves the presence set and drops presence listeners before detaching", async () => {
+        it("leaves the presence set and drops its presence listeners before detaching", async () => {
             const { channel, underlying } = setup();
+
+            channel.joining(noopListener());
 
             await settle(channel);
             channel.unsubscribe();
@@ -298,7 +300,12 @@ describe("AblyPresenceChannel", () => {
             const presence = underlying().presence;
 
             expect(presence.leave).toHaveBeenCalled();
-            expect(presence.unsubscribe).toHaveBeenCalledWith();
+            // This instance's own registration, not every presence listener on
+            // a channel a successor instance may also be using.
+            expect(presence.unsubscribe).toHaveBeenCalledWith(
+                ["enter", "update"],
+                expect.any(Function),
+            );
             expect(underlying().detach).toHaveBeenCalled();
 
             // leave → unsubscribe → detach: the member is out of the presence

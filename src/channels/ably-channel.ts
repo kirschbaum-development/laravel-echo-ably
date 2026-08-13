@@ -12,6 +12,25 @@ import type { AblyDriverOptions, EchoOptionsWithDefaults } from "../types";
 /** The ably-side listener wrapping an Echo callback. */
 type MessageListener = (message: InboundMessage) => void;
 
+/** The ably-side listener carrying channel state changes to this instance. */
+type StateListener = (change: ChannelStateChange) => void;
+
+/**
+ * The live channel instances sharing each underlying ably channel.
+ *
+ * `channels.get(name)` caches, so a leave→rejoin on the same name — React
+ * StrictMode's mount → cleanup → mount, most commonly — puts two instances of
+ * this class on one `RealtimeChannel`. Teardown is therefore instance-scoped:
+ * each instance removes only the listeners it registered, and the operations
+ * that act on the channel as a whole (`detach()`, leaving the presence set) are
+ * left to the last instance out. ably does not refcount attach intents, so a
+ * detach landing after the successor's attach would leave that successor
+ * silently unattached.
+ *
+ * Keyed weakly, so an entry lives exactly as long as the ably channel does.
+ */
+const liveInstances = new WeakMap<RealtimeChannel, Set<AblyChannel>>();
+
 /**
  * A public Ably channel, driven by Echo's channel contract.
  *
@@ -58,7 +77,13 @@ export class AblyChannel extends Channel {
     /** The most recent error, replayed to callbacks registered after it. */
     private lastError: unknown = null;
 
-    private stateListenerRegistered = false;
+    /**
+     * This instance's state listener, kept so teardown can remove exactly it —
+     * a blanket `off()` would take a successor instance's listener with it.
+     * Its presence is also the latch that keeps `subscribe()` from registering
+     * a second one.
+     */
+    private stateListener: StateListener | null = null;
 
     /**
      * Whether the current `subscribe()` attempt already had a failure reported
@@ -106,15 +131,16 @@ export class AblyChannel extends Channel {
                 this.channelOptions(),
             );
 
+            this.claimInstance(this.subscription);
+
             // One listener for the life of the ably channel: `subscribe()` runs
             // again on connection recovery, and a second registration would
             // double every `subscribed()` and `error()` callback.
-            if (!this.stateListenerRegistered) {
-                this.subscription.on((change: ChannelStateChange) =>
-                    this.handleStateChange(change),
-                );
+            if (!this.stateListener) {
+                this.stateListener = (change: ChannelStateChange) =>
+                    this.handleStateChange(change);
 
-                this.stateListenerRegistered = true;
+                this.subscription.on(this.stateListener);
             }
 
             await this.subscription.attach();
@@ -134,21 +160,49 @@ export class AblyChannel extends Channel {
 
     /**
      * Unsubscribe from the channel and detach it.
+     *
+     * Everything removed here is this instance's own: the underlying ably
+     * channel may already be shared with a successor instance created by a
+     * rejoin, and a blanket `unsubscribe()` / `off()` would wipe that
+     * successor's registrations while leaving it believing they are in place.
      */
     unsubscribe(): void {
+        // Captured before the maps are cleared: these are the ably-side
+        // listeners this instance put on the channel, and each is removed
+        // individually below.
+        const scoped = [...this.listeners].flatMap(([event, wrappers]) =>
+            [...wrappers.values()].map((wrapper) => ({ event, wrapper })),
+        );
+        const global = [...this.globalListeners.values()];
+
         this.listeners.clear();
         this.globalListeners.clear();
 
         this.whenReady((channel) => {
-            channel.unsubscribe();
-            channel.off();
+            scoped.forEach(({ event, wrapper }) =>
+                channel.unsubscribe(event, wrapper),
+            );
+            global.forEach((wrapper) => channel.unsubscribe(wrapper));
 
-            // Reset here rather than synchronously above: `unsubscribe()` can
+            // Removed here rather than synchronously above: `unsubscribe()` can
             // be called while the first `subscribe()` is still pending, and
-            // that `subscribe()` would then set the flag *after* a synchronous
-            // reset — leaving the flag claiming a listener `off()` just removed,
-            // so a later `subscribe()` would never register one again.
-            this.stateListenerRegistered = false;
+            // that `subscribe()` would then register a listener *after* a
+            // synchronous removal — leaving one behind that nothing tracks, so
+            // a later `subscribe()` would never register one again.
+            if (this.stateListener) {
+                channel.off(this.stateListener);
+
+                this.stateListener = null;
+            }
+
+            liveInstances.get(channel)?.delete(this);
+
+            // A successor instance is attached to the very same channel, and
+            // ably has no notion of two attach intents: detaching now would
+            // strand it.
+            if (this.sharedWithLiveInstance(channel)) {
+                return undefined;
+            }
 
             return channel.detach();
         });
@@ -304,6 +358,30 @@ export class AblyChannel extends Channel {
      */
     protected onChannelFailed(_change: ChannelStateChange): boolean {
         return false;
+    }
+
+    /**
+     * Whether another live instance of this driver is using the same underlying
+     * ably channel — the leave→rejoin case, where `channels.get` handed both
+     * instances the same object. Anything that would affect the channel as a
+     * whole belongs to the last instance out.
+     */
+    protected sharedWithLiveInstance(channel: RealtimeChannel): boolean {
+        const instances = liveInstances.get(channel);
+
+        if (!instances) {
+            return false;
+        }
+
+        return [...instances].some((instance) => instance !== this);
+    }
+
+    /** Record this instance as a user of the underlying ably channel. */
+    private claimInstance(channel: RealtimeChannel): void {
+        const instances = liveInstances.get(channel) ?? new Set<AblyChannel>();
+
+        instances.add(this);
+        liveInstances.set(channel, instances);
     }
 
     /**

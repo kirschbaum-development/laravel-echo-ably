@@ -1,4 +1,9 @@
-import type { PresenceAction, Realtime, RealtimeChannel } from "ably";
+import type {
+    PresenceAction,
+    PresenceMessage,
+    Realtime,
+    RealtimeChannel,
+} from "ably";
 import type { PresenceChannel } from "laravel-echo";
 import type { TokenManager } from "../auth/token-manager";
 import type { EchoOptionsWithDefaults } from "../types";
@@ -20,6 +25,17 @@ export class AblyPresenceChannel
 {
     /** The `here` callbacks, all served by a single read of the member list. */
     private hereCallbacks: CallableFunction[] = [];
+
+    /**
+     * The presence listeners this instance registered, kept so teardown can
+     * remove exactly them: the underlying ably channel may be shared with a
+     * successor instance, whose registrations a blanket `unsubscribe()` would
+     * take with it.
+     */
+    private readonly presenceListeners: Array<{
+        actions: PresenceAction[];
+        listener: (member: PresenceMessage) => void;
+    }> = [];
 
     /**
      * Create a new class instance.
@@ -79,15 +95,23 @@ export class AblyPresenceChannel
     unsubscribe(): void {
         this.hereCallbacks = [];
 
+        const registrations = this.presenceListeners.splice(0);
+
         // Queued before the base's teardown so the operations reach ably in
         // order: leave the presence set, drop the presence listeners, and only
         // then detach the channel that carries the leave message.
         this.whenReady((channel) => {
-            // Not reported: a channel being torn down has no failure worth
-            // surfacing, which is how the base treats a refused `detach()`.
-            const left = channel.presence.leave();
+            // A successor instance created by a rejoin has entered the presence
+            // set as the same client: leaving now would take its membership
+            // with it, so the last instance out does the leaving. Failures are
+            // not reported, the way the base treats a refused `detach()`.
+            const left = this.sharedWithLiveInstance(channel)
+                ? undefined
+                : channel.presence.leave();
 
-            channel.presence.unsubscribe();
+            registrations.forEach(({ actions, listener }) =>
+                channel.presence.unsubscribe(actions, listener),
+            );
 
             return left;
         });
@@ -142,9 +166,19 @@ export class AblyPresenceChannel
         action: PresenceAction | PresenceAction[],
         callback: CallableFunction,
     ): this {
+        const listener = (member: PresenceMessage) =>
+            callback(member.data as unknown);
+
+        // Tracked so teardown removes this registration alone, rather than
+        // every presence listener on a possibly shared ably channel.
+        this.presenceListeners.push({
+            actions: Array.isArray(action) ? action : [action],
+            listener,
+        });
+
         this.whenReady((channel) =>
             channel.presence
-                .subscribe(action, (member) => callback(member.data))
+                .subscribe(action, listener)
                 .catch((error: unknown) => this.dispatchError(error)),
         );
 

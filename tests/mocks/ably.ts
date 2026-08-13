@@ -251,9 +251,35 @@ export class MockChannel {
         },
     );
 
-    off = vi.fn((): void => {
-        this.stateListeners.clear();
-    });
+    /**
+     * Mirrors ably's `off`: no argument drops every state listener, a listener
+     * drops exactly that one, and an event narrows the removal to it.
+     */
+    off = vi.fn(
+        (
+            eventOrListener?: string | string[] | StateListener,
+            listener?: StateListener,
+        ): void => {
+            if (eventOrListener === undefined) {
+                this.stateListeners.clear();
+
+                return;
+            }
+
+            if (typeof eventOrListener === "function") {
+                this.stateListeners.remove(eventOrListener);
+
+                return;
+            }
+
+            this.stateListeners.removeByEvents(
+                Array.isArray(eventOrListener)
+                    ? eventOrListener
+                    : [eventOrListener],
+                listener,
+            );
+        },
+    );
 
     /** Move the channel to a new state and notify its state listeners. */
     emitStateChange(change: MockStateChange): void {

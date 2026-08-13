@@ -462,16 +462,33 @@ describe("AblyChannel", () => {
     });
 
     describe("unsubscribe", () => {
-        it("removes listeners, the state listener and detaches", async () => {
+        it("removes its own listeners and its state listener, then detaches", async () => {
             const { channel, underlying } = setup();
+            const message = vi.fn();
+            const global = vi.fn();
+            const subscribed = vi.fn();
 
+            channel.listen(".OrderShipped", message);
+            channel.listenToAll(global);
+            channel.subscribed(subscribed);
             await settle(channel);
+
             channel.unsubscribe();
             await settle(channel);
 
-            expect(underlying().unsubscribe).toHaveBeenCalledWith();
             expect(underlying().off).toHaveBeenCalled();
             expect(underlying().detach).toHaveBeenCalled();
+
+            subscribed.mockClear();
+            underlying().emitStateChange({ current: "attached" });
+            underlying().emitMessage({
+                name: "OrderShipped",
+                data: "payload",
+            });
+
+            expect(subscribed).not.toHaveBeenCalled();
+            expect(message).not.toHaveBeenCalled();
+            expect(global).not.toHaveBeenCalled();
         });
 
         it("leaves the state listener re-registerable when it races a pending subscribe", async () => {

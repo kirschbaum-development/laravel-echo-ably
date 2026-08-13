@@ -7,6 +7,7 @@ import { AblyPrivateChannel } from "../src/channels/ably-private-channel";
 import { AblyConnector } from "../src/connector";
 import { VERSION } from "../src/index";
 import {
+    deferred,
     echoOptions,
     makeJwt,
     settle,
@@ -393,6 +394,196 @@ describe("AblyConnector", () => {
             const { connector } = setup();
 
             expect(() => connector.leave("orders")).not.toThrow();
+        });
+    });
+
+    describe("leaving and rejoining the same name", () => {
+        it("leaves the successor channel working when the predecessor tears down", async () => {
+            // React StrictMode's mount → cleanup → mount, and any quick
+            // leave→rejoin: the teardown is still queued behind a token request
+            // when the successor is created, and `channels.get` hands that
+            // successor the very same underlying ably channel.
+            const gate = deferred<{ token: string }>();
+            const { realtime, connector } = setup({
+                requestTokenFn: vi.fn().mockReturnValue(gate.promise),
+            });
+
+            const first = connector.privateChannel("orders");
+
+            connector.leaveChannel("private-orders");
+
+            const second = connector.privateChannel("orders");
+            const subscribed = vi.fn();
+            const message = vi.fn();
+
+            expect(second).not.toBe(first);
+
+            second.subscribed(subscribed);
+            second.listen(".OrderShipped", message);
+
+            gate.resolve({ token: TOKEN });
+
+            await settle(first);
+            await settle(second);
+            await flush();
+
+            const underlying = realtime.channels.all["private:orders"];
+            const attached = underlying.attach.mock.invocationCallOrder;
+
+            // ably does not refcount attach intents, so any detach the channel
+            // being left issues has to land before the successor attaches —
+            // one landing after would leave it silently unattached.
+            underlying.detach.mock.invocationCallOrder.forEach((order) =>
+                expect(order).toBeLessThan(attached[attached.length - 1]),
+            );
+
+            subscribed.mockClear();
+            underlying.emitStateChange({
+                current: "attached",
+                previous: "attaching",
+            });
+
+            expect(subscribed).toHaveBeenCalledTimes(1);
+
+            underlying.emitMessage({ name: "OrderShipped", data: { id: 1 } });
+
+            expect(message).toHaveBeenCalledWith({ id: 1 });
+        });
+
+        it("keeps the successor presence channel entering and reporting members", async () => {
+            const gate = deferred<{ token: string }>();
+            const { realtime, connector } = setup({
+                requestTokenFn: vi.fn().mockReturnValue(gate.promise),
+            });
+
+            const first = connector.presenceChannel("chat");
+
+            connector.leaveChannel("presence-chat");
+
+            const second = connector.presenceChannel("chat");
+            const joined = vi.fn();
+
+            second.joining(joined);
+
+            gate.resolve({ token: TOKEN });
+
+            await settle(first);
+            await settle(second);
+            await flush();
+
+            const underlying = realtime.channels.all["presence:chat"];
+
+            underlying.presence.enter.mockClear();
+            underlying.emitStateChange({
+                current: "attached",
+                previous: "attaching",
+            });
+            await flush();
+
+            // Exactly one: the successor re-enters, the channel that was left
+            // does not.
+            expect(underlying.presence.enter).toHaveBeenCalledTimes(1);
+
+            underlying.presence.emit("enter", {
+                clientId: "u1",
+                data: { id: 1 },
+            });
+
+            expect(joined).toHaveBeenCalledWith({ id: 1 });
+        });
+
+        it("does not wipe the successor's registrations when the teardown lands late", async () => {
+            // The same race, with the ordering forced rather than left to the
+            // microtask queue: the predecessor's attach is still in flight
+            // while the successor subscribes, so its teardown runs after the
+            // successor has registered everything it cares about.
+            const { realtime, connector } = setup();
+            const underlying = realtime.channels.get("private:orders");
+            const attaching = deferred<null>();
+
+            underlying.attach.mockReturnValueOnce(attaching.promise);
+
+            const first = connector.privateChannel("orders");
+
+            connector.leaveChannel("private-orders");
+
+            const second = connector.privateChannel("orders");
+            const subscribed = vi.fn();
+            const message = vi.fn();
+
+            second.subscribed(subscribed);
+            second.listen(".OrderShipped", message);
+
+            await settle(second);
+
+            attaching.resolve(null);
+            await settle(first);
+            await flush();
+
+            expect(underlying.detach).not.toHaveBeenCalled();
+
+            subscribed.mockClear();
+            underlying.emitStateChange({
+                current: "attached",
+                previous: "attaching",
+            });
+
+            expect(subscribed).toHaveBeenCalledTimes(1);
+
+            underlying.emitMessage({ name: "OrderShipped", data: { id: 1 } });
+
+            expect(message).toHaveBeenCalledWith({ id: 1 });
+        });
+
+        it("does not strip the successor's presence registrations or its membership", async () => {
+            const { realtime, connector } = setup();
+            const underlying = realtime.channels.get("presence:chat");
+            const attaching = deferred<null>();
+
+            underlying.attach.mockReturnValueOnce(attaching.promise);
+
+            const first = connector.presenceChannel("chat");
+
+            connector.leaveChannel("presence-chat");
+
+            const second = connector.presenceChannel("chat");
+            const joined = vi.fn();
+
+            second.joining(joined);
+
+            await settle(second);
+
+            expect(underlying.presence.enter).toHaveBeenCalledTimes(1);
+
+            attaching.resolve(null);
+            await settle(first);
+            await flush();
+
+            // The channel that was left must not take the successor's member
+            // out of the presence set: both instances are the same client.
+            expect(underlying.presence.leave).not.toHaveBeenCalled();
+
+            underlying.presence.emit("enter", {
+                clientId: "u1",
+                data: { id: 1 },
+            });
+
+            expect(joined).toHaveBeenCalledWith({ id: 1 });
+        });
+
+        it("detaches once the last instance of the channel has left", async () => {
+            const { realtime, connector } = setup();
+
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            connector.leaveChannel("private-orders");
+            await flush();
+
+            expect(
+                realtime.channels.all["private:orders"].detach,
+            ).toHaveBeenCalledTimes(1);
         });
     });
 
