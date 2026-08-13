@@ -38,7 +38,8 @@
         "format:check": "prettier --check .",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
-        "test:watch": "vitest"
+        "test:watch": "vitest",
+        "test:integration": "vitest run --config vitest.integration.config.ts"
     },
     "engines": {
         "node": ">=20"

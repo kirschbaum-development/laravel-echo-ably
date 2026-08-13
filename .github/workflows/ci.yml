@@ -35,3 +35,42 @@ jobs:
             - run: npm test
 
             - run: npm run build
+
+    integration:
+        runs-on: ubuntu-latest
+
+        name: Ably integration
+
+        # A job-level `if` cannot read `secrets`, so the credential is exposed
+        # as job env and every step is gated on whether it turned up. Forks and
+        # pull requests without access to the secret run this job as a no-op.
+        env:
+            ABLY_SANDBOX_KEY: ${{ secrets.ABLY_SANDBOX_KEY }}
+            # Only needed when the key belongs to a non-production Ably app
+            # (e.g. `nonprod:sandbox`); unset means production.
+            ABLY_SANDBOX_ENDPOINT: ${{ secrets.ABLY_SANDBOX_ENDPOINT }}
+
+        steps:
+            - id: credentials
+              run: |
+                  if [ -n "$ABLY_SANDBOX_KEY" ]; then
+                    echo "present=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "present=false" >> "$GITHUB_OUTPUT"
+                    echo "No ABLY_SANDBOX_KEY available; skipping the integration suite." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+            - uses: actions/checkout@v6
+              if: steps.credentials.outputs.present == 'true'
+
+            - uses: actions/setup-node@v7
+              if: steps.credentials.outputs.present == 'true'
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - run: npm ci
+              if: steps.credentials.outputs.present == 'true'
+
+            - run: npm run test:integration
+              if: steps.credentials.outputs.present == 'true'

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AblyPresenceChannel } from "../src/channels/ably-presence-channel";
 import type { ChannelHarness, ChannelOverrides } from "./helpers";
 import {
+    deferred,
     noopListener,
     settle,
     setupChannel,
@@ -60,6 +61,27 @@ describe("AblyPresenceChannel", () => {
             await settle(channel);
 
             expect(underlying().presence.enter).toHaveBeenCalledWith(undefined);
+        });
+
+        it("reads the member list only once the enter has been acknowledged", async () => {
+            // Ably's presence set does not carry a member whose enter is still
+            // in flight: a read racing it comes back without this member in it.
+            const { channel, realtime, underlying } = setup();
+            const entered = deferred<void>();
+
+            realtime.channels
+                .get(NAME)
+                .presence.enter.mockReturnValue(entered.promise);
+            channel.here(noopListener());
+
+            await settle(channel);
+
+            expect(underlying().presence.get).not.toHaveBeenCalled();
+
+            entered.resolve();
+            await settle(channel);
+
+            expect(underlying().presence.get).toHaveBeenCalledTimes(1);
         });
 
         it("routes an enter rejection to error callbacks without an unhandled rejection", async () => {

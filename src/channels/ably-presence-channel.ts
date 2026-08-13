@@ -36,8 +36,15 @@ export class AblyPresenceChannel
         // ably re-attaches on its own after a connection recovery, and a member
         // who is not re-entered there is silently absent from then on.
         this.subscribed(() =>
-            this.whenReady((channel) => {
-                this.enter(channel);
+            this.whenReady(async (channel) => {
+                // The member list is read only once the enter has been
+                // acknowledged: ably's presence set does not carry a member
+                // whose enter is still in flight, so a read racing it would
+                // hand `here()` a list this member is missing from. A refused
+                // enter is reported and then read past, so `here()` still
+                // describes whoever else is there.
+                await this.enter(channel);
+
                 this.readMembers(channel);
             }),
         );
@@ -89,17 +96,21 @@ export class AblyPresenceChannel
     }
 
     /**
-     * Announce this member to the presence set.
+     * Announce this member to the presence set. Resolves either way — the
+     * caller reads the member list next, whether or not this member made it in.
      */
-    private enter(channel: RealtimeChannel): void {
-        channel.presence
-            // `presenceInfo` is undefined when the token came from a wildcard
-            // capability grant, which carries no per-channel `info`. Entering
-            // without data is valid, and beats not entering at all.
-            .enter(this.tokenManager.presenceInfo(this.name))
-            // `whenReady` swallows chain rejections, so a refused enter is
-            // reported from here or not at all.
-            .catch((error: unknown) => this.dispatchError(error));
+    private enter(channel: RealtimeChannel): Promise<void> {
+        return (
+            channel.presence
+                // `presenceInfo` is undefined when the token came from a
+                // wildcard capability grant, which carries no per-channel
+                // `info`. Entering without data is valid, and beats not
+                // entering at all.
+                .enter(this.tokenManager.presenceInfo(this.name))
+                // `whenReady` swallows chain rejections, so a refused enter is
+                // reported from here or not at all.
+                .catch((error: unknown) => this.dispatchError(error))
+        );
     }
 
     /**
