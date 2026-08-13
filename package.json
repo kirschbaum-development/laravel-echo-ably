@@ -1,0 +1,62 @@
+{
+    "name": "@kirschbaum-development/laravel-echo-ably",
+    "version": "0.1.0",
+    "description": "Native Ably (ably-js v2) driver for Laravel Echo 2.x",
+    "keywords": [
+        "laravel",
+        "echo",
+        "ably",
+        "websockets",
+        "broadcasting"
+    ],
+    "homepage": "https://github.com/kirschbaum-development/laravel-echo-ably",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/kirschbaum-development/laravel-echo-ably"
+    },
+    "license": "MIT",
+    "type": "module",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "publishConfig": {
+        "access": "public"
+    },
+    "scripts": {
+        "build": "vite build",
+        "lint": "eslint --config eslint.config.js \"src/**/*.ts\" \"tests/**/*.ts\"",
+        "format": "prettier --write .",
+        "format:check": "prettier --check .",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "test:watch": "vitest"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "peerDependencies": {
+        "ably": "^2.0",
+        "laravel-echo": "^2.0"
+    },
+    "devDependencies": {
+        "@typescript-eslint/eslint-plugin": "^8.67.0",
+        "@typescript-eslint/parser": "^8.67.0",
+        "ably": "^2.27.0",
+        "eslint": "^10.8.1",
+        "laravel-echo": "^2.4.0",
+        "prettier": "^3.9.6",
+        "typescript": "^6.0.3",
+        "vite": "^8.2.1",
+        "vite-plugin-dts": "^5.0.3",
+        "vitest": "^4.1.10"
+    }
+}

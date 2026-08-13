@@ -1,0 +1,8 @@
+dist/
+coverage/
+package-lock.json
+
+# Design documents authored outside the package code style. They embed code
+# snippets that later tasks copy verbatim, so they are left byte-for-byte alone.
+docs/
+.superpowers/
