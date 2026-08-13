@@ -77,6 +77,7 @@ describe("AblyConnector", () => {
 
     afterEach(() => {
         vi.restoreAllMocks();
+        vi.unstubAllGlobals();
     });
 
     describe("connect", () => {
@@ -144,6 +145,33 @@ describe("AblyConnector", () => {
                 connector.tokenManager.authCallback,
             );
             expect(options.authCallback).not.toBe(authCallback);
+        });
+
+        it("builds the token manager from the merged Echo options", async () => {
+            const fetchMock = vi
+                .fn()
+                .mockResolvedValue(
+                    new Response(JSON.stringify({ token: TOKEN })),
+                );
+
+            vi.stubGlobal("fetch", fetchMock);
+
+            const realtime = createMockRealtime();
+            const connector = new AblyConnector({
+                broadcaster: AblyConnector,
+                bearerToken: "bearer-value",
+                ably: { client: realtime },
+            });
+
+            await settle(connector.privateChannel("orders"));
+
+            // Both the endpoint and the Authorization header come from the
+            // merge Echo's base connector performs, not from what was passed in.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(fetchMock.mock.calls[0][0]).toBe("/broadcasting/auth");
+            expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+                Authorization: "Bearer bearer-value",
+            });
         });
     });
 
