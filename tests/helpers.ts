@@ -75,6 +75,7 @@ type ChannelConstructor<TChannel extends AblyChannel> = new (
 /** What a test may vary about the channel the harness builds. */
 export type ChannelOverrides = {
     ensureCapability?: Mock;
+    presenceInfo?: Mock;
     options?: EchoOptionsWithDefaults;
     name?: string;
 };
@@ -83,6 +84,7 @@ export type ChannelHarness<TChannel extends AblyChannel> = {
     realtime: MockRealtime;
     channel: TChannel;
     ensureCapability: Mock;
+    presenceInfo: Mock;
     /** The underlying mock channel; only present once `subscribe()` got that far. */
     underlying: () => MockChannel;
 };
@@ -95,9 +97,11 @@ export function setupChannel<TChannel extends AblyChannel>(
     const name = overrides.name ?? CHANNEL_NAME;
     const ensureCapability =
         overrides.ensureCapability ?? vi.fn().mockResolvedValue(undefined);
+    const presenceInfo =
+        overrides.presenceInfo ?? vi.fn().mockReturnValue(undefined);
     const tokenManager = {
         ensureCapability,
-        presenceInfo: () => undefined,
+        presenceInfo,
     } as unknown as TokenManager;
     const realtime = createMockRealtime();
 
@@ -112,6 +116,7 @@ export function setupChannel<TChannel extends AblyChannel>(
         realtime,
         channel,
         ensureCapability,
+        presenceInfo,
         underlying: () => realtime.channels.all[name],
     };
 }
