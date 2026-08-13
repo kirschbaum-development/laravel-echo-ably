@@ -1,20 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseJwt, toTokenDetails } from "../src/auth/jwt";
-
-function makeJwt(payload: Record<string, unknown>): string {
-    // base64url via web APIs only, so the fixtures stay valid in whichever
-    // environment the suite runs in (no Buffer, matching the browser target).
-    const b64 = (obj: unknown) => {
-        const bytes = new TextEncoder().encode(JSON.stringify(obj));
-
-        return btoa(String.fromCharCode(...bytes))
-            .replace(/\+/g, "-")
-            .replace(/\//g, "_")
-            .replace(/=+$/, "");
-    };
-
-    return `${b64({ alg: "HS256", typ: "JWT", kid: "keyName" })}.${b64(payload)}.signature`;
-}
+import { makeJwt } from "./helpers";
 
 const payload = {
     iat: 1_700_000_000,
