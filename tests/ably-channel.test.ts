@@ -304,15 +304,21 @@ describe("AblyChannel", () => {
             channel.subscribed(callback);
             await settle(channel);
 
+            // The attach that ran through `subscribe()` fired this one.
+            expect(callback).toHaveBeenCalledTimes(1);
+
             await channel.subscribe();
 
-            // One call per attach; a duplicate listener would double each one.
-            expect(callback).toHaveBeenCalledTimes(2);
+            // Attaching an already-attached channel changes no state, so ably
+            // sends nothing and there is nothing to report.
+            expect(callback).toHaveBeenCalledTimes(1);
 
+            // The re-attach a recovered connection would send, driven here:
+            // one call per attach, and a duplicate listener would double it.
             underlying().emitStateChange({ current: "attached" });
 
             expect(underlying().on).toHaveBeenCalledTimes(1);
-            expect(callback).toHaveBeenCalledTimes(3);
+            expect(callback).toHaveBeenCalledTimes(2);
         });
 
         it("fires error callbacks when a state change carries a reason", async () => {
@@ -510,11 +516,12 @@ describe("AblyChannel", () => {
             callback.mockClear();
             await channel.subscribe();
 
-            expect(callback).toHaveBeenCalledTimes(1);
-
+            // The channel is still attached, so the attach itself emits
+            // nothing: the re-attach is driven here, and a channel left
+            // without a state listener would never hear it.
             underlying().emitStateChange({ current: "attached" });
 
-            expect(callback).toHaveBeenCalledTimes(2);
+            expect(callback).toHaveBeenCalledTimes(1);
         });
     });
 

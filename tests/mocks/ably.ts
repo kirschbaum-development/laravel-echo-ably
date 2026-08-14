@@ -238,8 +238,17 @@ export class MockChannel {
      * A successful attach reports `resumed: false`, which is what a fresh
      * attach — the only kind this drives — carries on the wire. A test that
      * needs a resumed one emits the state change itself.
+     *
+     * Attaching an already-attached channel changes nothing and emits nothing:
+     * ably resolves immediately in that case, which is what lets two driver
+     * instances share one attached channel. A mock that re-emitted `attached`
+     * there would hand the second instance an attach event ably never sends.
      */
     attach = vi.fn((): Promise<unknown> => {
+        if (this.state === "attached") {
+            return Promise.resolve(null);
+        }
+
         const failure = this.attachFailure;
 
         if (failure !== null) {
