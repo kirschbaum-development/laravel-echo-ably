@@ -8,6 +8,22 @@ import { vi } from "vitest";
 
 export type MockMessage = { name: string; data: unknown };
 
+/**
+ * A message as ably's history endpoint returns it: the live shape plus the
+ * `id` and `timestamp` a catch-up anchors on.
+ */
+export type MockHistoryMessage = MockMessage & {
+    id: string;
+    timestamp: number;
+};
+
+/** The slice of ably's `PaginatedResult` a history walk uses. */
+export type MockHistoryPage = {
+    items: MockHistoryMessage[];
+    hasNext(): boolean;
+    next(): Promise<MockHistoryPage | null>;
+};
+
 export type MockStateChange = {
     current: string;
     previous?: string;
@@ -142,6 +158,35 @@ export class MockPresence {
     }
 }
 
+/** One page of history results, linked to the page that follows it. */
+function historyPage(
+    items: MockHistoryMessage[],
+    next: MockHistoryPage | null,
+): MockHistoryPage {
+    return {
+        items,
+        hasNext: vi.fn((): boolean => next !== null),
+        next: vi.fn((): Promise<MockHistoryPage | null> =>
+            Promise.resolve(next),
+        ),
+    };
+}
+
+/**
+ * Chain `pages` into the paginated result ably's `history()` hands back, first
+ * page first. No pages at all is one empty page, which is what a channel with
+ * no retained history answers with.
+ */
+export function historyPages(pages: MockHistoryMessage[][]): MockHistoryPage {
+    let chained: MockHistoryPage | null = null;
+
+    for (let index = pages.length - 1; index >= 0; index -= 1) {
+        chained = historyPage(pages[index], chained);
+    }
+
+    return chained ?? historyPage([], null);
+}
+
 export class MockChannel {
     state = "initialized";
     errorReason: unknown = null;
@@ -195,6 +240,14 @@ export class MockChannel {
 
     publish = vi.fn((_name: string, _data: unknown): Promise<void> =>
         Promise.resolve(),
+    );
+
+    /**
+     * The history endpoint a catch-up queries. Empty by default; a test that
+     * needs results feeds it `historyPages([...])`.
+     */
+    history = vi.fn((_params?: unknown): Promise<MockHistoryPage> =>
+        Promise.resolve(historyPages([])),
     );
 
     subscribe = vi.fn(

@@ -7,6 +7,8 @@ import type {
 } from "ably";
 import { Channel, EventFormatter } from "laravel-echo";
 import type { TokenManager } from "../auth/token-manager";
+import { normalizeReplay } from "../replay/replay-engine";
+import type { NormalizedReplay } from "../replay/types";
 import type { AblyDriverOptions, EchoOptionsWithDefaults } from "../types";
 
 /** The ably-side listener wrapping an Echo callback. */
@@ -58,6 +60,9 @@ export class AblyChannel extends Channel {
 
     protected tokenManager: TokenManager;
 
+    /** Whether this channel replays missed events, and how many at most. */
+    protected replayConfig: NormalizedReplay;
+
     /** Echo callback → its ably listener, keyed by formatted event name. */
     private readonly listeners = new Map<
         string,
@@ -86,6 +91,14 @@ export class AblyChannel extends Channel {
     private stateListener: StateListener | null = null;
 
     /**
+     * This instance's catch-all message listener, in replay mode. Kept for the
+     * reason the state listener is: teardown removes exactly it, and its
+     * presence is the latch that keeps a second `subscribe()` from registering
+     * a second one.
+     */
+    private catchAllListener: MessageListener | null = null;
+
+    /**
      * Whether the current `subscribe()` attempt already had a failure reported
      * through the state listener. ably rejects `attach()` with the same error
      * it has just emitted as a state change, so without this the one failure
@@ -102,6 +115,8 @@ export class AblyChannel extends Channel {
         name: string,
         options: EchoOptionsWithDefaults,
         tokenManager: TokenManager,
+        /** Off unless the connector hands down a normalized `ably.replay`. */
+        replay: NormalizedReplay = normalizeReplay(undefined),
     ) {
         super();
 
@@ -109,6 +124,7 @@ export class AblyChannel extends Channel {
         this.name = name;
         this.options = options;
         this.tokenManager = tokenManager;
+        this.replayConfig = replay;
         this.eventFormatter = new EventFormatter(this.options.namespace);
 
         this.ready = this.subscribe();
@@ -143,6 +159,8 @@ export class AblyChannel extends Channel {
                 this.subscription.on(this.stateListener);
             }
 
+            this.registerCatchAll();
+
             await this.subscription.attach();
         } catch (error) {
             // Ownership: anything the channel reported as a state change
@@ -169,7 +187,8 @@ export class AblyChannel extends Channel {
     unsubscribe(): void {
         // Captured before the maps are cleared: these are the ably-side
         // listeners this instance put on the channel, and each is removed
-        // individually below.
+        // individually below. In replay mode there are none — the catch-all
+        // stands in for all of them.
         const scoped = [...this.listeners].flatMap(([event, wrappers]) =>
             [...wrappers.values()].map((wrapper) => ({ event, wrapper })),
         );
@@ -179,10 +198,22 @@ export class AblyChannel extends Channel {
         this.globalListeners.clear();
 
         this.whenReady((channel) => {
-            scoped.forEach(({ event, wrapper }) =>
-                channel.unsubscribe(event, wrapper),
-            );
-            global.forEach((wrapper) => channel.unsubscribe(wrapper));
+            if (this.replayConfig.enabled) {
+                // Replay mode never put those listeners on the channel: one
+                // catch-all carries every one of them, so that is what comes
+                // off here. Read from the field rather than captured above for
+                // the reason the state listener is, below.
+                if (this.catchAllListener) {
+                    channel.unsubscribe(this.catchAllListener);
+
+                    this.catchAllListener = null;
+                }
+            } else {
+                scoped.forEach(({ event, wrapper }) =>
+                    channel.unsubscribe(event, wrapper),
+                );
+                global.forEach((wrapper) => channel.unsubscribe(wrapper));
+            }
 
             // Removed here rather than synchronously above: `unsubscribe()` can
             // be called while the first `subscribe()` is still pending, and
@@ -232,7 +263,7 @@ export class AblyChannel extends Channel {
 
         this.globalListeners.set(callback, wrapper);
 
-        this.whenReady((channel) => channel.subscribe(wrapper));
+        this.updateSubscription((channel) => channel.subscribe(wrapper));
 
         return this;
     }
@@ -251,7 +282,7 @@ export class AblyChannel extends Channel {
         if (!callback) {
             this.listeners.delete(name);
 
-            this.whenReady((channel) => channel.unsubscribe(name));
+            this.updateSubscription((channel) => channel.unsubscribe(name));
 
             return this;
         }
@@ -268,7 +299,9 @@ export class AblyChannel extends Channel {
             this.listeners.delete(name);
         }
 
-        this.whenReady((channel) => channel.unsubscribe(name, wrapper));
+        this.updateSubscription((channel) =>
+            channel.unsubscribe(name, wrapper),
+        );
 
         return this;
     }
@@ -283,7 +316,9 @@ export class AblyChannel extends Channel {
             if (wrapper) {
                 this.globalListeners.delete(callback);
 
-                this.whenReady((channel) => channel.unsubscribe(wrapper));
+                this.updateSubscription((channel) =>
+                    channel.unsubscribe(wrapper),
+                );
             }
 
             return this;
@@ -295,7 +330,7 @@ export class AblyChannel extends Channel {
 
         // Not `channel.unsubscribe()`: that would also drop the event-scoped
         // listeners registered through `listen()`.
-        this.whenReady((channel) => {
+        this.updateSubscription((channel) => {
             wrappers.forEach((wrapper) => channel.unsubscribe(wrapper));
         });
 
@@ -346,9 +381,40 @@ export class AblyChannel extends Channel {
 
         wrappers.set(callback, wrapper);
 
-        this.whenReady((channel) => channel.subscribe(event, wrapper));
+        this.updateSubscription((channel) => channel.subscribe(event, wrapper));
 
         return this;
+    }
+
+    /**
+     * Take a message off the catch-all subscription registered in replay mode.
+     *
+     * The seam the replay engine sits behind: until it is wired in, a message
+     * is routed the moment it lands.
+     */
+    protected onIncoming(message: InboundMessage): void {
+        this.routeMessage(message);
+    }
+
+    /**
+     * Deliver a message to this instance's listeners.
+     *
+     * The wrappers are called directly — the very functions ably itself would
+     * have called through a per-event subscription — so a message routed here
+     * is formatted by exactly the code that formats one on the default path.
+     * `listen()` keys its wrappers by formatted event name, which is what keeps
+     * `listenForWhisper` and `notification` working through this route too.
+     */
+    protected routeMessage(message: InboundMessage): void {
+        // Copied before the walk: a callback that calls `stopListening` from
+        // inside its own delivery must not disturb the run it is part of.
+        const wrappers = [
+            ...(this.listeners.get(message.name ?? "")?.values() ?? []),
+        ];
+        const global = [...this.globalListeners.values()];
+
+        wrappers.forEach((wrapper) => wrapper(message));
+        global.forEach((wrapper) => wrapper(message));
     }
 
     /**
@@ -374,6 +440,50 @@ export class AblyChannel extends Channel {
         }
 
         return [...instances].some((instance) => instance !== this);
+    }
+
+    /**
+     * Put this instance's one catch-all subscription on the ably channel, in
+     * replay mode.
+     *
+     * Every message the channel carries has to reach the replay engine in
+     * arrival order, which per-event subscriptions cannot promise: a message
+     * nobody is listening for yet still moves the cursor. Registered once for
+     * the life of the ably channel, for the reason the state listener is, and
+     * before the attach so nothing published after it is missed.
+     */
+    private registerCatchAll(): void {
+        if (!this.replayConfig.enabled || this.catchAllListener) {
+            return;
+        }
+
+        this.catchAllListener = (message: InboundMessage) =>
+            this.onIncoming(message);
+
+        // ably settles this with the attach that follows it, which is where a
+        // failure is reported; swallowed here so the same one does not also
+        // surface as an unhandled rejection.
+        void this.subscription
+            .subscribe(this.catchAllListener)
+            .catch(() => undefined);
+    }
+
+    /**
+     * Apply a change to this instance's per-event ably subscriptions.
+     *
+     * Replay mode has none to change: its single catch-all carries the whole
+     * channel and `routeMessage` decides who hears what from the same internal
+     * maps the caller has just updated, so the bookkeeping is the whole
+     * operation.
+     */
+    private updateSubscription(
+        operation: (channel: RealtimeChannel) => unknown,
+    ): void {
+        if (this.replayConfig.enabled) {
+            return;
+        }
+
+        this.whenReady(operation);
     }
 
     /** Record this instance as a user of the underlying ably channel. */
