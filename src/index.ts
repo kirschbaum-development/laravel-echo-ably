@@ -6,7 +6,11 @@ export { AblyChannel } from "./channels/ably-channel";
 export { AblyPresenceChannel } from "./channels/ably-presence-channel";
 export { AblyPrivateChannel } from "./channels/ably-private-channel";
 export { AblyConnector } from "./connector";
-export type { ReplayOptions, ReplayResult } from "./replay/types";
+export type {
+    NormalizedReplay,
+    ReplayOptions,
+    ReplayResult,
+} from "./replay/types";
 export type {
     AblyDriverOptions,
     EchoOptionsWithDefaults,
