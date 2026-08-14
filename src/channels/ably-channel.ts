@@ -654,11 +654,22 @@ export class AblyChannel extends Channel {
                     this.fannedOut = null;
                 }
 
-                this.recoveredCallbacks.forEach((callback) => callback(result));
+                // Copied for the reason `routeMessage` copies, and isolated
+                // one by one: these are user code, and the result was promised
+                // to every one of them. A throw is reported through `error()`
+                // rather than skipping the registrations behind it — the chain
+                // here has nobody awaiting it, so it would vanish otherwise.
+                [...this.recoveredCallbacks].forEach((callback) => {
+                    try {
+                        callback(result);
+                    } catch (error) {
+                        this.dispatchError(error);
+                    }
+                });
             })
-            // The engine settles rather than rejects, so the only rejection
-            // reachable here is a `recovered` callback throwing — and nobody is
-            // awaiting this chain to catch it.
+            // The last resort: `dispatchError` reaches the app's `error()`
+            // callbacks, which are user code too, and there is nowhere left to
+            // report a failure of the failure reporter to.
             .catch(() => undefined);
 
         return attempt;

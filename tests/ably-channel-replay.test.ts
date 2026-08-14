@@ -363,6 +363,35 @@ describe("AblyChannel replay wiring", () => {
             expect(second).toHaveBeenCalledTimes(2);
         });
 
+        it("keeps a throwing callback from stranding the registrations behind it", async () => {
+            const { channel, underlying } = setupChannel(AblyChannel, {
+                replay: REPLAY_ON,
+            });
+            const failure = new Error("recovered callback threw");
+            const behind = vi.fn();
+            const errors: unknown[] = [];
+
+            channel.error((error: unknown) => errors.push(error));
+            channel.recovered(() => {
+                throw failure;
+            });
+            channel.recovered(behind);
+            await settle(channel);
+
+            underlying().emitMessage(message("m0", 0));
+            underlying().history.mockResolvedValue(
+                historyPages([[message("m1", 10), message("m0", 0)]]),
+            );
+
+            underlying().emitStateChange(GAP);
+            await flush();
+
+            // The result was promised to every registration, and the failure
+            // is the app's to hear about rather than the fan-out's to swallow.
+            expect(behind).toHaveBeenCalledWith({ complete: true, count: 1 });
+            expect(errors).toEqual([failure]);
+        });
+
         it("fans out once for a gap that joined a manual catch-up already running", async () => {
             const { channel, underlying } = setupChannel(AblyChannel, {
                 replay: REPLAY_ON,
