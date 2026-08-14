@@ -4,12 +4,14 @@
  * Structural on purpose: the engine knows nothing about ably, so its tests need
  * no SDK at all and the channel adapts at the boundary. ably's `InboundMessage`
  * carries `id` and `timestamp` as required fields but leaves `name` and `data`
- * optional, so that adapter fills `name` in (`message.name ?? ""`, exactly as
- * `AblyChannel.listenToAll` already does) rather than casting.
+ * optional, and this keeps them optional: the engine only ever carries a name
+ * through to the dispatch path, and a message that arrived without one has to
+ * reach it as one — an absent name matches no event listener, where an empty
+ * string would match a `on("")` registration the live path could never feed.
  */
 export type ReplayMessage = {
     id: string;
-    name: string;
+    name?: string;
     data: unknown;
     timestamp: number;
 };

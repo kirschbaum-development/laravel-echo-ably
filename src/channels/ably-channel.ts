@@ -518,9 +518,13 @@ export class AblyChannel extends Channel {
         // Copied before the walk: a callback that calls `stopListening` from
         // inside its own delivery must not disturb the run it is part of.
         const global = [...this.globalListeners.values()];
-        const wrappers = [
-            ...(this.listeners.get(message.name ?? "")?.values() ?? []),
-        ];
+        // A message with no name matches no event, so only the catch-alls hear
+        // it — the same answer ably gives, where an absent name is not the
+        // empty string and cannot match a `subscribe("", ...)`.
+        const wrappers =
+            message.name === undefined
+                ? []
+                : [...(this.listeners.get(message.name)?.values() ?? [])];
 
         global.forEach((wrapper) => wrapper(message));
         wrappers.forEach((wrapper) => wrapper(message));
@@ -799,15 +803,18 @@ function toHistoryPage(page: PaginatedResult<InboundMessage>): HistoryPage {
 }
 
 /**
- * One ably message in the engine's vocabulary. Mapped rather than cast: ably
- * leaves a message's name optional, and the engine's `name` is the formatted
- * event every listener is keyed by.
+ * One ably message in the engine's vocabulary. Mapped rather than cast: the
+ * engine's `id` and `timestamp` are the anchors a catch-up needs, where ably
+ * types them per its own contract.
+ *
+ * The name is carried across as it arrived, absent included: it is the event
+ * every listener is keyed by, and a replayed message has to match exactly what
+ * the live one would have.
  */
 function toReplayMessage(message: InboundMessage): ReplayMessage {
     return {
         id: message.id,
-        // The fallback `listenToAll` already applies on the live path.
-        name: message.name ?? "",
+        name: message.name,
         data: message.data,
         timestamp: message.timestamp,
     };

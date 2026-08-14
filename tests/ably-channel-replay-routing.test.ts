@@ -194,6 +194,24 @@ describe("AblyChannel replay-mode routing", () => {
             expect(replay).toEqual(standard);
         });
 
+        it("keeps a nameless message off the event-scoped listeners", async () => {
+            const { replay, standard } = await bothModes(
+                (channel, seen) => {
+                    channel.listenToAll((event: unknown, data: unknown) =>
+                        seen("global", event, data),
+                    );
+                    // A registration nothing can match: ably delivers a
+                    // nameless message to catch-alls only, and an absent name
+                    // is not the empty string.
+                    channel.on("", (data: unknown) => seen("empty", data));
+                },
+                (mock) => mock.emitMessage(nameless("no name")),
+            );
+
+            expect(replay).toEqual([["global", ".", "no name"]]);
+            expect(replay).toEqual(standard);
+        });
+
         it("gives listenToAll the message before the listen() callbacks, either registration order", async () => {
             const emit = (mock: MockChannel) =>
                 mock.emitMessage({ name: "OrderShipped", data: "payload" });
