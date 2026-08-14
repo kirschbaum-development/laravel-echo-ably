@@ -404,17 +404,23 @@ export class AblyChannel extends Channel {
      * is formatted by exactly the code that formats one on the default path.
      * `listen()` keys its wrappers by formatted event name, which is what keeps
      * `listenForWhisper` and `notification` working through this route too.
+     *
+     * `listenToAll` callbacks go first, which is ably's order rather than a
+     * choice made here: its `EventEmitter.emit` walks `anyOnce → any →
+     * eventsOnce → events`, so a catch-all runs ahead of the per-event
+     * listeners however the two were registered. An app logging through
+     * `listenToAll` sees the same sequence in both modes.
      */
     protected routeMessage(message: InboundMessage): void {
         // Copied before the walk: a callback that calls `stopListening` from
         // inside its own delivery must not disturb the run it is part of.
+        const global = [...this.globalListeners.values()];
         const wrappers = [
             ...(this.listeners.get(message.name ?? "")?.values() ?? []),
         ];
-        const global = [...this.globalListeners.values()];
 
-        wrappers.forEach((wrapper) => wrapper(message));
         global.forEach((wrapper) => wrapper(message));
+        wrappers.forEach((wrapper) => wrapper(message));
     }
 
     /**

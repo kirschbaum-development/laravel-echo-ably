@@ -83,13 +83,25 @@ class ListenerRegistry<TListener, TEvent extends string> {
         this.listeners.clear();
     }
 
-    /** Fire every listener watching `event`, plus every catch-all listener. */
+    /**
+     * Fire every catch-all listener, then every listener watching `event`.
+     *
+     * That order is ably's, not an implementation detail to sample: its
+     * `EventEmitter.emit` concatenates `anyOnce → any → eventsOnce → events`
+     * and walks the result, so a catch-all registered last still runs before
+     * the per-event listeners. A registry that fired them in registration
+     * order would let the driver's own routing diverge unnoticed.
+     */
     emit(event: TEvent, deliver: (listener: TListener) => void): void {
-        for (const [listener, events] of [...this.listeners]) {
-            if (events === null || events.includes(event)) {
-                deliver(listener);
-            }
-        }
+        const registered = [...this.listeners];
+
+        registered
+            .filter(([, events]) => events === null)
+            .forEach(([listener]) => deliver(listener));
+
+        registered
+            .filter(([, events]) => events !== null && events.includes(event))
+            .forEach(([listener]) => deliver(listener));
     }
 }
 

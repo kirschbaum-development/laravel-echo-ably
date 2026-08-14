@@ -194,29 +194,39 @@ describe("AblyChannel replay-mode routing", () => {
             expect(replay).toEqual(standard);
         });
 
-        it("delivers to a listen() callback and a listenToAll one at once", async () => {
-            const { replay, standard } = await bothModes(
-                (channel, seen) => {
-                    channel.listen(".OrderShipped", (data: unknown) =>
-                        seen("scoped", data),
-                    );
-                    channel.listenToAll((event: unknown, data: unknown) =>
-                        seen("global", event, data),
-                    );
-                },
-                (mock) => {
-                    mock.emitMessage({
-                        name: "OrderShipped",
-                        data: "payload",
-                    });
-                },
-            );
+        it("gives listenToAll the message before the listen() callbacks, either registration order", async () => {
+            const emit = (mock: MockChannel) =>
+                mock.emitMessage({ name: "OrderShipped", data: "payload" });
+            const scoped = (seen: (...args: unknown[]) => void) => ({
+                listen: (data: unknown) => seen("scoped", data),
+                all: (event: unknown, data: unknown) =>
+                    seen("global", event, data),
+            });
 
-            expect(replay).toEqual([
-                ["scoped", "payload"],
+            const scopedFirst = await bothModes((channel, seen) => {
+                const callbacks = scoped(seen);
+
+                channel.listen(".OrderShipped", callbacks.listen);
+                channel.listenToAll(callbacks.all);
+            }, emit);
+            const globalFirst = await bothModes((channel, seen) => {
+                const callbacks = scoped(seen);
+
+                channel.listenToAll(callbacks.all);
+                channel.listen(".OrderShipped", callbacks.listen);
+            }, emit);
+
+            // ably's order, not registration order: `EventEmitter.emit` walks
+            // its catch-all listeners before the per-event ones.
+            const expected = [
                 ["global", ".OrderShipped", "payload"],
-            ]);
-            expect(replay).toEqual(standard);
+                ["scoped", "payload"],
+            ];
+
+            expect(scopedFirst.replay).toEqual(expected);
+            expect(scopedFirst.standard).toEqual(expected);
+            expect(globalFirst.replay).toEqual(expected);
+            expect(globalFirst.standard).toEqual(expected);
         });
     });
 
