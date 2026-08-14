@@ -780,4 +780,15 @@ describe("normalizeReplay", () => {
     it("treats an empty options object as enabled with the default limit", () => {
         expect(normalizeReplay({})).toEqual({ enabled: true, limit: 100 });
     });
+
+    it("falls back to the default limit for a limit below one", () => {
+        expect(normalizeReplay({ limit: 0 })).toEqual({
+            enabled: true,
+            limit: 100,
+        });
+        expect(normalizeReplay({ limit: -5 })).toEqual({
+            enabled: true,
+            limit: 100,
+        });
+    });
 });

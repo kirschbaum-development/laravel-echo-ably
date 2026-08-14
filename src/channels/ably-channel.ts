@@ -2,17 +2,37 @@ import type {
     ChannelOptions,
     ChannelStateChange,
     InboundMessage,
+    PaginatedResult,
     Realtime,
     RealtimeChannel,
+    RealtimeHistoryParams,
 } from "ably";
 import { Channel, EventFormatter } from "laravel-echo";
 import type { TokenManager } from "../auth/token-manager";
-import { normalizeReplay } from "../replay/replay-engine";
-import type { NormalizedReplay } from "../replay/types";
+import { normalizeReplay, ReplayEngine } from "../replay/replay-engine";
+import type {
+    HistoryPage,
+    NormalizedReplay,
+    ReplayMessage,
+    ReplayResult,
+} from "../replay/types";
 import type { AblyDriverOptions, EchoOptionsWithDefaults } from "../types";
 
+/**
+ * The slice of a message the routing path reads.
+ *
+ * Structural rather than ably's `InboundMessage`, because a replayed message
+ * arrives in the engine's own vocabulary and has to reach the very same
+ * wrappers a live one does. Nothing here narrows what ably delivers: every
+ * `InboundMessage` is one of these.
+ */
+type RoutableMessage = { name?: string; data?: unknown };
+
 /** The ably-side listener wrapping an Echo callback. */
-type MessageListener = (message: InboundMessage) => void;
+type MessageListener = (message: RoutableMessage) => void;
+
+/** The catch-all listener, in ably's own terms — it is what ably calls. */
+type InboundListener = (message: InboundMessage) => void;
 
 /** The ably-side listener carrying channel state changes to this instance. */
 type StateListener = (change: ChannelStateChange) => void;
@@ -60,8 +80,16 @@ export class AblyChannel extends Channel {
 
     protected tokenManager: TokenManager;
 
-    /** Whether this channel replays missed events, and how many at most. */
-    protected replayConfig: NormalizedReplay;
+    /**
+     * Whether this channel replays missed events, and how many at most. Fixed
+     * for the life of the channel: the engine's gate, its bookkeeping and the
+     * subscription shape all follow from it, and none of them can change mode
+     * mid-flight.
+     */
+    protected readonly replayConfig: NormalizedReplay;
+
+    /** The replay engine, in replay mode; `null` when replay is off. */
+    protected readonly engine: ReplayEngine | null;
 
     /** Echo callback → its ably listener, keyed by formatted event name. */
     private readonly listeners = new Map<
@@ -78,6 +106,22 @@ export class AblyChannel extends Channel {
     private readonly subscribedCallbacks: CallableFunction[] = [];
 
     private readonly errorCallbacks: CallableFunction[] = [];
+
+    private readonly recoveredCallbacks: Array<(result: ReplayResult) => void> =
+        [];
+
+    /**
+     * Whether this channel has ever reached `attached`. The first attach
+     * reports no continuity too, and there is nothing behind it to have missed.
+     */
+    private hasAttachedBefore = false;
+
+    /**
+     * The catch-up whose result is already promised to the `recovered`
+     * callbacks. Attempts coalesce in the engine, so the fan-out is keyed on
+     * the attempt rather than on the call that asked for it.
+     */
+    private fannedOut: Promise<ReplayResult> | null = null;
 
     /** The most recent error, replayed to callbacks registered after it. */
     private lastError: unknown = null;
@@ -96,7 +140,7 @@ export class AblyChannel extends Channel {
      * presence is the latch that keeps a second `subscribe()` from registering
      * a second one.
      */
-    private catchAllListener: MessageListener | null = null;
+    private catchAllListener: InboundListener | null = null;
 
     /**
      * Whether the current `subscribe()` attempt already had a failure reported
@@ -125,6 +169,7 @@ export class AblyChannel extends Channel {
         this.options = options;
         this.tokenManager = tokenManager;
         this.replayConfig = replay;
+        this.engine = replay.enabled ? this.createEngine(replay.limit) : null;
         this.eventFormatter = new EventFormatter(this.options.namespace);
 
         this.ready = this.subscribe();
@@ -196,6 +241,11 @@ export class AblyChannel extends Channel {
 
         this.listeners.clear();
         this.globalListeners.clear();
+
+        // The registrations go first: resetting settles a catch-up still in
+        // flight, and its result belongs to nobody now.
+        this.recoveredCallbacks.length = 0;
+        this.engine?.reset();
 
         this.whenReady((channel) => {
             if (this.replayConfig.enabled) {
@@ -362,6 +412,40 @@ export class AblyChannel extends Channel {
     }
 
     /**
+     * Register a callback to be called after every catch-up attempt, whether
+     * it healed the channel or not, with the result the attempt produced.
+     *
+     * One call per attempt: a gap detected while a catch-up is running joins
+     * it, and the one result it produces is fanned out once. Never fires unless
+     * replay is enabled. Cleared by `unsubscribe()`, like the listeners are.
+     */
+    recovered(callback: (result: ReplayResult) => void): this {
+        this.recoveredCallbacks.push(callback);
+
+        return this;
+    }
+
+    /**
+     * Catch up on whatever was missed since the last delivered message, on
+     * demand — a backgrounded tab coming back, most commonly.
+     *
+     * Rejects only when replay is not configured. A catch-up that fails
+     * resolves `{complete: false, count: 0}`, the same answer the automatic
+     * path gets, and reports the reason through `error()`.
+     */
+    replayMissed(): Promise<ReplayResult> {
+        if (!this.engine) {
+            return Promise.reject(
+                new Error(
+                    "Replay is not enabled for this connection: set `ably.replay` in the Echo options to use replayMissed().",
+                ),
+            );
+        }
+
+        return this.fanOut(this.engine.replayMissed());
+    }
+
+    /**
      * Bind to a raw Ably event name, without namespace formatting.
      */
     on(event: string, callback: CallableFunction): this {
@@ -389,11 +473,17 @@ export class AblyChannel extends Channel {
     /**
      * Take a message off the catch-all subscription registered in replay mode.
      *
-     * The seam the replay engine sits behind: until it is wired in, a message
-     * is routed the moment it lands.
+     * The engine sits here: it moves the cursor and routes the message on, or
+     * holds it back while a catch-up puts the backlog in front of it first.
      */
     protected onIncoming(message: InboundMessage): void {
-        this.routeMessage(message);
+        if (!this.engine) {
+            this.routeMessage(message);
+
+            return;
+        }
+
+        this.engine.handleMessage(toReplayMessage(message));
     }
 
     /**
@@ -411,7 +501,7 @@ export class AblyChannel extends Channel {
      * listeners however the two were registered. An app logging through
      * `listenToAll` sees the same sequence in both modes.
      */
-    protected routeMessage(message: InboundMessage): void {
+    protected routeMessage(message: RoutableMessage): void {
         // Copied before the walk: a callback that calls `stopListening` from
         // inside its own delivery must not disturb the run it is part of.
         const global = [...this.globalListeners.values()];
@@ -475,6 +565,93 @@ export class AblyChannel extends Channel {
     }
 
     /**
+     * The replay engine for this channel, wired to the three things it needs
+     * from it: ably's history endpoint, the routing path every listener hangs
+     * off, and the `error()` callbacks.
+     */
+    private createEngine(limit: number): ReplayEngine {
+        return new ReplayEngine({
+            history: (params) => this.queryHistory(params),
+            // Unguarded on purpose: the engine isolates every dispatch and
+            // reports whatever a listener throws through `onError` below.
+            dispatch: (message) => this.routeMessage(message),
+            onError: (error) => this.dispatchError(error),
+            limit,
+        });
+    }
+
+    /**
+     * Run one history query for the engine, in the engine's vocabulary.
+     *
+     * The engine builds ably's `RealtimeHistoryParams` but is kept clear of
+     * ably's types, so they are cast back on the way in; the results are mapped
+     * rather than cast on the way out, because `InboundMessage` leaves `name`
+     * optional where a replayed message needs it.
+     */
+    private async queryHistory(
+        params: Record<string, unknown>,
+    ): Promise<HistoryPage> {
+        const page = await this.subscription.history(
+            params as RealtimeHistoryParams,
+        );
+
+        return toHistoryPage(page);
+    }
+
+    /**
+     * Record an attach, and catch up when it lost continuity.
+     *
+     * `resumed: false` says ably could not resume the previous attachment, so
+     * whatever was published while this channel was away never reached it. The
+     * first attach reports it too and is not a gap: nothing came before it.
+     *
+     * The engine's gate closes inside this call, synchronously, which is what
+     * keeps a message arriving straight after the attach behind the backlog it
+     * belongs after.
+     */
+    private noteAttached(change: ChannelStateChange): void {
+        const attachedBefore = this.hasAttachedBefore;
+
+        this.hasAttachedBefore = true;
+
+        if (!this.engine || !attachedBefore || change.resumed !== false) {
+            return;
+        }
+
+        void this.fanOut(this.engine.gapDetected());
+    }
+
+    /**
+     * Promise a catch-up's result to the `recovered` callbacks, once.
+     *
+     * Coalescing in the engine is mode-blind — a gap during a manual catch-up
+     * joins it and is handed the same promise back — so registrations are keyed
+     * on the attempt: one attempt, one result, one fan-out.
+     */
+    private fanOut(attempt: Promise<ReplayResult>): Promise<ReplayResult> {
+        if (this.fannedOut === attempt) {
+            return attempt;
+        }
+
+        this.fannedOut = attempt;
+
+        void attempt
+            .then((result) => {
+                if (this.fannedOut === attempt) {
+                    this.fannedOut = null;
+                }
+
+                this.recoveredCallbacks.forEach((callback) => callback(result));
+            })
+            // The engine settles rather than rejects, so the only rejection
+            // reachable here is a `recovered` callback throwing — and nobody is
+            // awaiting this chain to catch it.
+            .catch(() => undefined);
+
+        return attempt;
+    }
+
+    /**
      * Apply a change to this instance's per-event ably subscriptions.
      *
      * Replay mode has none to change: its single catch-all carries the whole
@@ -531,6 +708,11 @@ export class AblyChannel extends Channel {
      */
     private handleStateChange(change: ChannelStateChange): void {
         if (change.current === "attached") {
+            // Ahead of the callbacks: a gap has to close the engine's gate
+            // before anything else on this tick, and a `subscribed` callback is
+            // user code that may well publish.
+            this.noteAttached(change);
+
             this.subscribedCallbacks.forEach((callback) => callback());
         }
 
@@ -574,4 +756,35 @@ export class AblyChannel extends Channel {
 
         return driverOptions.channelOptions?.[this.name];
     }
+}
+
+/**
+ * Adapt a page of ably history to the one the engine walks, its items mapped
+ * one by one and the pages behind it adapted as they are reached.
+ */
+function toHistoryPage(page: PaginatedResult<InboundMessage>): HistoryPage {
+    return {
+        items: page.items.map(toReplayMessage),
+        hasNext: () => page.hasNext(),
+        next: async () => {
+            const next = await page.next();
+
+            return next ? toHistoryPage(next) : null;
+        },
+    };
+}
+
+/**
+ * One ably message in the engine's vocabulary. Mapped rather than cast: ably
+ * leaves a message's name optional, and the engine's `name` is the formatted
+ * event every listener is keyed by.
+ */
+function toReplayMessage(message: InboundMessage): ReplayMessage {
+    return {
+        id: message.id,
+        // The fallback `listenToAll` already applies on the live path.
+        name: message.name ?? "",
+        data: message.data,
+        timestamp: message.timestamp,
+    };
 }

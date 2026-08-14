@@ -6,14 +6,26 @@ import { vi } from "vitest";
  * helpers push events back the way a live connection would.
  */
 
-export type MockMessage = { name: string; data: unknown };
+export type MockMessage = {
+    name: string;
+    data: unknown;
+    /**
+     * ably stamps both on every message it delivers; they are optional here
+     * because only the tests that exercise the replay cursor care about them.
+     */
+    id?: string;
+    timestamp?: number;
+};
 
 /**
- * A message as ably's history endpoint returns it: the live shape plus the
- * `id` and `timestamp` a catch-up anchors on.
+ * A message as ably's history endpoint returns it: the `id` and `timestamp` a
+ * catch-up anchors on, and the optional `name` `InboundMessage` declares — a
+ * published message need not carry one.
  */
-export type MockHistoryMessage = MockMessage & {
+export type MockHistoryMessage = {
     id: string;
+    name?: string;
+    data: unknown;
     timestamp: number;
 };
 
@@ -222,6 +234,10 @@ export class MockChannel {
      * Attaching drives the channel state machine the way ably does: it emits
      * the resulting state change before settling, and a failure both emits
      * `failed` and rejects with the very same error.
+     *
+     * A successful attach reports `resumed: false`, which is what a fresh
+     * attach — the only kind this drives — carries on the wire. A test that
+     * needs a resumed one emits the state change itself.
      */
     attach = vi.fn((): Promise<unknown> => {
         const failure = this.attachFailure;
@@ -238,7 +254,11 @@ export class MockChannel {
             return Promise.reject(failure);
         }
 
-        this.emitStateChange({ current: "attached", previous: "attaching" });
+        this.emitStateChange({
+            current: "attached",
+            previous: "attaching",
+            resumed: false,
+        });
 
         return Promise.resolve(null);
     });

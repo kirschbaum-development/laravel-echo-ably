@@ -10,6 +10,8 @@ import { TokenManager } from "./auth/token-manager";
 import { AblyChannel } from "./channels/ably-channel";
 import { AblyPresenceChannel } from "./channels/ably-presence-channel";
 import { AblyPrivateChannel } from "./channels/ably-private-channel";
+import { normalizeReplay } from "./replay/replay-engine";
+import type { NormalizedReplay } from "./replay/types";
 import type { AblyDriverOptions, EchoOptionsWithDefaults } from "./types";
 import {
     baseName,
@@ -40,6 +42,7 @@ type ChannelConstructor<TChannel extends AblyChannel> = new (
     name: string,
     options: EchoOptionsWithDefaults,
     tokenManager: TokenManager,
+    replay: NormalizedReplay,
 ) => TChannel;
 
 /** Ably's connection states, in Echo's connection-status vocabulary. */
@@ -105,6 +108,14 @@ export class AblyConnector extends Connector<
     private recoverySpent = false;
 
     /**
+     * How every channel on this connection replays missed events, normalized
+     * once here. Assigned by `connect()`, which the base constructor calls
+     * before this class's field initializers run — so it carries no initializer
+     * of its own to overwrite it with.
+     */
+    private replayConfig!: NormalizedReplay;
+
+    /**
      * Create a fresh Ably connection.
      */
     connect(): void {
@@ -114,6 +125,7 @@ export class AblyConnector extends Connector<
         // constructor: the CSRF and bearer headers the auth request needs are
         // injected during that merge.
         this.tokenManager = new TokenManager(this.options, driverOptions);
+        this.replayConfig = normalizeReplay(driverOptions.replay);
         this.ably = driverOptions.client ?? this.createClient(driverOptions);
         this.tokenManager.setClient(this.ably);
 
@@ -280,6 +292,7 @@ export class AblyConnector extends Connector<
                 name,
                 this.options,
                 this.tokenManager,
+                this.replayConfig,
             );
         }
 

@@ -1,5 +1,6 @@
 import type { ChannelStateChange, Realtime, RealtimeChannel } from "ably";
 import type { TokenManager } from "../auth/token-manager";
+import type { NormalizedReplay } from "../replay/types";
 import type { EchoOptionsWithDefaults } from "../types";
 import { AblyChannel } from "./ably-channel";
 
@@ -29,8 +30,9 @@ export class AblyPrivateChannel extends AblyChannel {
         name: string,
         options: EchoOptionsWithDefaults,
         tokenManager: TokenManager,
+        replay?: NormalizedReplay,
     ) {
-        super(ably, name, options, tokenManager);
+        super(ably, name, options, tokenManager, replay);
 
         // Every `attached` transition ends a retry cycle, including ones this
         // channel did not initiate (an ably-driven reattach, a re-subscribe

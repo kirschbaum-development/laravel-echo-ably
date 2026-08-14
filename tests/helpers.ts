@@ -3,6 +3,7 @@ import type { Mock } from "vitest";
 import { vi } from "vitest";
 import type { TokenManager } from "../src/auth/token-manager";
 import type { AblyChannel } from "../src/channels/ably-channel";
+import type { NormalizedReplay } from "../src/replay/types";
 import type { EchoOptionsWithDefaults } from "../src/types";
 import type { MockChannel, MockRealtime } from "./mocks/ably";
 import { createMockRealtime } from "./mocks/ably";
@@ -70,6 +71,7 @@ type ChannelConstructor<TChannel extends AblyChannel> = new (
     name: string,
     options: EchoOptionsWithDefaults,
     tokenManager: TokenManager,
+    replay?: NormalizedReplay,
 ) => TChannel;
 
 /** What a test may vary about the channel the harness builds. */
@@ -78,6 +80,8 @@ export type ChannelOverrides = {
     presenceInfo?: Mock;
     options?: EchoOptionsWithDefaults;
     name?: string;
+    /** The replay config the connector would have normalized; off by default. */
+    replay?: NormalizedReplay;
 };
 
 export type ChannelHarness<TChannel extends AblyChannel> = {
@@ -110,6 +114,7 @@ export function setupChannel<TChannel extends AblyChannel>(
         name,
         overrides.options ?? echoOptions(),
         tokenManager,
+        overrides.replay,
     );
 
     return {

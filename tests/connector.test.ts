@@ -13,8 +13,12 @@ import {
     settle,
     withoutUnhandledRejections,
 } from "./helpers";
-import type { MockRealtime } from "./mocks/ably";
-import { createMockRealtime } from "./mocks/ably";
+import type {
+    MockHistoryMessage,
+    MockMessage,
+    MockRealtime,
+} from "./mocks/ably";
+import { createMockRealtime, historyPages } from "./mocks/ably";
 
 /**
  * The ably module is mocked so the client-construction path can be asserted on
@@ -64,6 +68,24 @@ function decodeBase64Url(value: string): string {
 /** Let the fire-and-forget work a state change kicked off run to completion. */
 function flush(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+const BASE_TIME = 1_700_000_000_000;
+
+/**
+ * A message carrying what a replay cursor anchors on, in both the live and the
+ * history shape.
+ */
+function replayable(
+    id: string,
+    offset: number,
+): MockMessage & MockHistoryMessage {
+    return {
+        id,
+        name: "App\\Events\\OrderShipped",
+        data: { id },
+        timestamp: BASE_TIME + offset,
+    };
 }
 
 /** The connection failing the way a login or a logout makes it fail. */
@@ -249,6 +271,92 @@ describe("AblyConnector", () => {
                 "public:orders",
                 "private:orders",
             ]);
+        });
+    });
+
+    describe("replay", () => {
+        it("heals a gap on a channel it built from `ably.replay`", async () => {
+            const { realtime, connector } = setup({ replay: true });
+            const channel = connector.channel("orders");
+            const seen: string[] = [];
+            const recovered = vi.fn();
+
+            channel.listen("OrderShipped", (data: unknown) =>
+                seen.push((data as { id: string }).id),
+            );
+            channel.recovered(recovered);
+            await settle(channel);
+
+            const mock = realtime.channels.all["public:orders"];
+
+            mock.emitMessage(replayable("m0", 0));
+            mock.history.mockResolvedValue(
+                historyPages([[replayable("m1", 10), replayable("m0", 0)]]),
+            );
+
+            mock.emitStateChange({
+                current: "attached",
+                previous: "attaching",
+                resumed: false,
+            });
+            await flush();
+
+            expect(seen).toEqual(["m0", "m1"]);
+            expect(recovered).toHaveBeenCalledWith({
+                complete: true,
+                count: 1,
+            });
+        });
+
+        it("normalizes the limit an options object carries", async () => {
+            const { realtime, connector } = setup({ replay: { limit: 5 } });
+            const channel = connector.channel("orders");
+
+            await settle(channel);
+
+            const mock = realtime.channels.all["public:orders"];
+
+            mock.emitMessage(replayable("m0", 0));
+
+            await channel.replayMissed();
+
+            expect(mock.history).toHaveBeenCalledWith({
+                start: BASE_TIME,
+                direction: "forwards",
+                limit: 5,
+            });
+        });
+
+        it("reaches private and presence channels too", async () => {
+            const { connector } = setup({ replay: true });
+            const privateChannel = connector.privateChannel("orders");
+            const presence = connector.presenceChannel("chat");
+
+            await settle(privateChannel);
+            await settle(presence);
+
+            // Nothing was ever delivered on either, so there is no cursor to
+            // catch up from — but the engine is there, which is what a rejection
+            // would disprove.
+            await expect(privateChannel.replayMissed()).resolves.toEqual({
+                complete: false,
+                count: 0,
+            });
+            await expect(presence.replayMissed()).resolves.toEqual({
+                complete: false,
+                count: 0,
+            });
+        });
+
+        it("leaves replay off when `ably.replay` is not configured", async () => {
+            const { connector } = setup();
+            const channel = connector.channel("orders");
+
+            await settle(channel);
+
+            await expect(channel.replayMissed()).rejects.toThrow(
+                /ably\.replay/,
+            );
         });
     });
 

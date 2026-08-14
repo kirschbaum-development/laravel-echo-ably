@@ -37,7 +37,11 @@ export function normalizeReplay(
     options: ReplayOptions | undefined,
 ): NormalizedReplay {
     if (options && typeof options === "object") {
-        return { enabled: true, limit: options.limit ?? DEFAULT_LIMIT };
+        const limit = options.limit ?? DEFAULT_LIMIT;
+
+        // A limit below one replays nothing and fails every catch-up, which is
+        // not a thing anyone configures on purpose.
+        return { enabled: true, limit: limit >= 1 ? limit : DEFAULT_LIMIT };
     }
 
     return { enabled: options === true, limit: DEFAULT_LIMIT };

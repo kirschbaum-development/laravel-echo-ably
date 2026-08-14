@@ -6,6 +6,7 @@ import type {
 } from "ably";
 import type { PresenceChannel } from "laravel-echo";
 import type { TokenManager } from "../auth/token-manager";
+import type { NormalizedReplay } from "../replay/types";
 import type { EchoOptionsWithDefaults } from "../types";
 import { AblyPrivateChannel } from "./ably-private-channel";
 
@@ -45,8 +46,9 @@ export class AblyPresenceChannel
         name: string,
         options: EchoOptionsWithDefaults,
         tokenManager: TokenManager,
+        replay?: NormalizedReplay,
     ) {
-        super(ably, name, options, tokenManager);
+        super(ably, name, options, tokenManager, replay);
 
         // Presence is re-established on every `attached`, not just the first:
         // ably re-attaches on its own after a connection recovery, and a member
