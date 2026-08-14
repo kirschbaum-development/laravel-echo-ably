@@ -211,7 +211,7 @@ new Echo({
 });
 ```
 
-The package exports `ReplayOptions` (the config) and `ReplayResult` (`{complete, count}`) for annotating your own handlers.
+The package exports `ReplayOptions` (the config) and `ReplayResult` (`{complete, count}`) for annotating your own handlers. In TypeScript, `recovered()` and `replayMissed()` are driver methods rather than part of Echo's own channel contract, so type the channel as the exported `AblyChannel` (or `AblyPrivateChannel`, `AblyPresenceChannel`) to reach them.
 
 ### `recovered()`
 
@@ -268,7 +268,7 @@ A catch-up can only return what Ably still holds:
 
 "Persist all messages" is a channel rule you add in the Ably dashboard, matched against a channel _namespace_ — the part before the first `:`. This driver namespaces every channel by kind (`public:orders`, `private:orders`, `presence:chat`), so a rule on `private` covers every private channel the app opens. Ably's [message storage docs](https://ably.com/docs/storage-history/storage) are the authority on the retention numbers for your package.
 
-The default window is worth a second thought: it is the same two minutes as the resume window. A gap the driver detects is by definition one that outlived the resume window — and un-persisted history has expired right along with it, so the catch-up will honestly report `complete: false` and your app will refetch. Turn persistence on for the namespaces you want auto-replay to actually heal.
+The default window is worth a second thought: on Ably's current defaults it is the same two minutes as the resume window. A gap the driver detects is by definition one that outlived the resume window, so while those two clocks match, un-persisted history has expired right along with it and the catch-up reports `complete: false` — an honest miss your app refetches from, rather than a partial replay. Both windows are Ably's to set, so this is a description of how the defaults line up today, not a guarantee to lean on: turn persistence on for the namespaces you want auto-replay to actually heal.
 
 ### The `history` capability
 
