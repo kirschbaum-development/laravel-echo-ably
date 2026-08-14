@@ -1,13 +1,22 @@
+import type { Realtime } from "ably";
 import { describe, expect, it, vi } from "vitest";
+import type { TokenManager } from "../src/auth/token-manager";
 import { AblyChannel } from "../src/channels/ably-channel";
 import { AblyPresenceChannel } from "../src/channels/ably-presence-channel";
 import { AblyPrivateChannel } from "../src/channels/ably-private-channel";
 import type { NormalizedReplay } from "../src/replay/types";
-import { deferred, setupChannel, settle } from "./helpers";
+import {
+    CHANNEL_NAME,
+    deferred,
+    echoOptions,
+    setupChannel,
+    settle,
+} from "./helpers";
 import type {
     MockHistoryMessage,
     MockHistoryPage,
     MockMessage,
+    MockRealtime,
 } from "./mocks/ably";
 import { historyPages } from "./mocks/ably";
 
@@ -48,6 +57,26 @@ function flush(): Promise<void> {
 /** The `id` of every message that reached a `listen()` callback. */
 function ids(seen: unknown[]): string[] {
     return seen.map((data) => (data as { id: string }).id);
+}
+
+/**
+ * A second driver instance on the channel `realtime` has already handed out —
+ * the leave→rejoin case, where `channels.get` caches and both instances end up
+ * on one `RealtimeChannel`.
+ */
+function rejoin(realtime: MockRealtime): AblyChannel {
+    const tokenManager = {
+        ensureCapability: vi.fn().mockResolvedValue(undefined),
+        presenceInfo: vi.fn().mockReturnValue(undefined),
+    } as unknown as TokenManager;
+
+    return new AblyChannel(
+        realtime as unknown as Realtime,
+        CHANNEL_NAME,
+        echoOptions(),
+        tokenManager,
+        REPLAY_ON,
+    );
 }
 
 describe("AblyChannel replay wiring", () => {
@@ -154,6 +183,50 @@ describe("AblyChannel replay wiring", () => {
                 limit: 100,
             });
             expect(recovered).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe("leaving and rejoining the same channel", () => {
+        it("treats the successor instance's first gap as a gap, not a first attach", async () => {
+            const {
+                realtime,
+                channel: left,
+                underlying,
+            } = setupChannel(AblyChannel, { replay: REPLAY_ON });
+
+            await settle(left);
+
+            // The connector's teardown: the cache entry is dropped, and the
+            // rejoin that follows lands on the very same ably channel.
+            left.unsubscribe();
+
+            const rejoined = rejoin(realtime);
+            const attached = vi.fn();
+            const recovered = vi.fn();
+
+            rejoined.subscribed(attached);
+
+            await settle(left);
+            await settle(rejoined);
+
+            // The premise: the channel was attached the whole way through, so
+            // ably resolved the successor's attach without an event of its own.
+            expect(underlying().state).toBe("attached");
+            expect(attached).not.toHaveBeenCalled();
+
+            rejoined.recovered(recovered);
+
+            underlying().emitStateChange(GAP);
+            await flush();
+
+            // A real gap on an instance that has delivered nothing yet: there
+            // is no cursor to heal from, but the app still has to hear that it
+            // must refetch. Reading this as a first attach would say nothing.
+            expect(recovered).toHaveBeenCalledTimes(1);
+            expect(recovered).toHaveBeenCalledWith({
+                complete: false,
+                count: 0,
+            });
         });
     });
 

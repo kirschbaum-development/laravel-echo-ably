@@ -113,6 +113,10 @@ export class AblyChannel extends Channel {
     /**
      * Whether this channel has ever reached `attached`. The first attach
      * reports no continuity too, and there is nothing behind it to have missed.
+     *
+     * Seeded from the channel's own state in `subscribe()`, because an instance
+     * that inherits an attached channel is handed no attach event to learn it
+     * from.
      */
     private hasAttachedBefore = false;
 
@@ -191,6 +195,15 @@ export class AblyChannel extends Channel {
                 this.name,
                 this.channelOptions(),
             );
+
+            // A channel handed over already attached has attached before this
+            // instance existed — a leave→rejoin, where the predecessor left it
+            // up for this one. ably sends no `attached` event for an attach
+            // that changes nothing, so the state itself is the only record of
+            // it, and without this the first real gap would read as a first
+            // attach: no catch-up, and no `recovered()` telling the app to
+            // refetch.
+            this.hasAttachedBefore ||= this.subscription.state === "attached";
 
             this.claimInstance(this.subscription);
 
