@@ -4,7 +4,9 @@ import type {
     HistoryPage,
     ReplayDeps,
     ReplayMessage,
+    ReplayResult,
 } from "../src/replay/types";
+import { withoutUnhandledRejections } from "./helpers";
 
 const BASE_TIME = 1_700_000_000_000;
 
@@ -186,7 +188,11 @@ describe("gapDetected", () => {
 
         const attempt = harness.engine.gapDetected();
 
-        harness.engine.handleMessage(message("live", 4_000));
+        // More than one, in arrival order: the flush has an order of its own to
+        // get right, not just a position after the backlog.
+        harness.engine.handleMessage(message("live-1", 4_000));
+        harness.engine.handleMessage(message("live-2", 5_000));
+        harness.engine.handleMessage(message("live-3", 6_000));
 
         await expect(attempt).resolves.toEqual({ complete: true, count: 3 });
         expect(harness.history).toHaveBeenCalledWith({
@@ -194,8 +200,33 @@ describe("gapDetected", () => {
             direction: "backwards",
             limit: 100,
         });
-        expect(delivered(harness)).toEqual(["m1", "m2", "m3", "live"]);
-        await expect(cursorTimestamp(harness)).resolves.toBe(BASE_TIME + 4_000);
+        expect(delivered(harness)).toEqual([
+            "m1",
+            "m2",
+            "m3",
+            "live-1",
+            "live-2",
+            "live-3",
+        ]);
+        await expect(cursorTimestamp(harness)).resolves.toBe(BASE_TIME + 6_000);
+    });
+
+    it("anchors the cursor on the last message it replayed", async () => {
+        // With an empty buffer there is no live message to hide behind: the
+        // cursor can only have come from the replay itself.
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const latest = message("m2", 2_000);
+
+        harness.history.mockResolvedValueOnce(
+            pages([latest, message("m1", 1_000), anchor]),
+        );
+
+        await expect(harness.engine.gapDetected()).resolves.toEqual({
+            complete: true,
+            count: 2,
+        });
+        await expect(cursorTimestamp(harness)).resolves.toBe(latest.timestamp);
     });
 
     it("stops paginating as soon as the cursor turns up", async () => {
@@ -484,6 +515,124 @@ describe("failures", () => {
         expect(harness.dispatch).toHaveBeenCalledTimes(1_002);
         inFlight.resolve(pages([anchor]));
     });
+
+    it("ignores a history rejection that lands after the cap abandoned the catch-up", async () => {
+        const harness = anchoredEngine(message("m0", 0));
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+
+        const rejections = await withoutUnhandledRejections(async () => {
+            const attempt = harness.engine.gapDetected();
+
+            for (let index = 0; index <= 1_000; index += 1) {
+                harness.engine.handleMessage(
+                    message(`live-${index}`, 10_000 + index),
+                );
+            }
+
+            await attempt;
+
+            inFlight.reject(new Error("history unavailable"));
+        });
+
+        // The cap's own report and nothing else: the request nobody is waiting
+        // on has no result to report, and no rejection to leak either.
+        expect(harness.onError).toHaveBeenCalledTimes(1);
+        expect(rejections).toEqual([]);
+    });
+
+    it("keeps flushing, and settles, when a listener throws mid-drain", async () => {
+        // `dispatch` runs the app's listeners. One of them throwing must not
+        // strand the messages behind it, nor the caller waiting on the result:
+        // the flush-always rule covers user code too.
+        const failure = new Error("history unavailable");
+        const listenerFailure = new Error("listener blew up");
+        const harness = anchoredEngine(message("m0", 0));
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+        harness.dispatch.mockImplementation((message) => {
+            if (message.id === "live-2") {
+                throw listenerFailure;
+            }
+        });
+
+        let result: ReplayResult | undefined;
+
+        const rejections = await withoutUnhandledRejections(async () => {
+            const attempt = harness.engine.gapDetected();
+
+            harness.engine.handleMessage(message("live-1", 4_000));
+            harness.engine.handleMessage(message("live-2", 5_000));
+            harness.engine.handleMessage(message("live-3", 6_000));
+
+            inFlight.reject(failure);
+
+            result = await attempt;
+        });
+
+        expect(result).toEqual({ complete: false, count: 0 });
+        expect(delivered(harness)).toEqual(["live-1", "live-2", "live-3"]);
+        expect(harness.onError).toHaveBeenCalledWith(failure);
+        expect(harness.onError).toHaveBeenCalledWith(listenerFailure);
+        expect(rejections).toEqual([]);
+    });
+
+    it("replays past a listener that throws and reports the backlog honestly", async () => {
+        // Stepping over the bad listener is what keeps the no-partial rule
+        // true: an aborted replay would report a miss it had already half made.
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const failure = new Error("listener blew up");
+
+        harness.dispatch.mockImplementation((message) => {
+            if (message.id === "m2") {
+                throw failure;
+            }
+        });
+        harness.history.mockResolvedValueOnce(
+            pages([
+                message("m3", 3_000),
+                message("m2", 2_000),
+                message("m1", 1_000),
+                anchor,
+            ]),
+        );
+
+        await expect(harness.engine.gapDetected()).resolves.toEqual({
+            complete: true,
+            count: 3,
+        });
+        expect(delivered(harness)).toEqual(["m1", "m2", "m3"]);
+        expect(harness.onError).toHaveBeenCalledWith(failure);
+    });
+
+    it("settles even when the app's error handler throws", async () => {
+        // `onError` reaches the same user code `error()` callbacks do, and it
+        // is reached from inside the failure path: a throw there would strand
+        // the gate closed with nothing left to reopen it.
+        const harness = anchoredEngine(message("m0", 0));
+
+        harness.history.mockRejectedValueOnce(new Error("history unavailable"));
+        harness.onError.mockImplementation(() => {
+            throw new Error("error handler blew up");
+        });
+
+        const rejections = await withoutUnhandledRejections(async () => {
+            await expect(harness.engine.gapDetected()).resolves.toEqual({
+                complete: false,
+                count: 0,
+            });
+        });
+
+        expect(rejections).toEqual([]);
+
+        // The gate reopened: live traffic still reaches the app.
+        harness.engine.handleMessage(message("live", 4_000));
+
+        expect(delivered(harness)).toEqual(["live"]);
+    });
 });
 
 describe("coalescing", () => {
@@ -569,6 +718,39 @@ describe("reset", () => {
             count: 0,
         });
         expect(harness.history).toHaveBeenCalledTimes(2);
+    });
+
+    it("stops a flush in its tracks when a listener resets the channel", async () => {
+        // A listener unsubscribing mid-flush is the channel going away. The
+        // rest of the drain would only re-anchor the cursor `reset()` just
+        // cleared, so it stops where it stands.
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+        harness.dispatch.mockImplementation((message) => {
+            if (message.id === "live-1") {
+                harness.engine.reset();
+            }
+        });
+
+        const attempt = harness.engine.gapDetected();
+
+        harness.engine.handleMessage(message("live-1", 4_000));
+        harness.engine.handleMessage(message("live-2", 5_000));
+
+        inFlight.resolve(pages([anchor]));
+
+        await expect(attempt).resolves.toEqual({ complete: true, count: 0 });
+        expect(delivered(harness)).toEqual(["live-1"]);
+
+        // The cursor stayed cleared: the drain did not undo the reset.
+        await expect(harness.engine.gapDetected()).resolves.toEqual({
+            complete: false,
+            count: 0,
+        });
+        expect(harness.history).toHaveBeenCalledTimes(1);
     });
 });
 

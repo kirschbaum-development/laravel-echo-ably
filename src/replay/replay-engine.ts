@@ -69,6 +69,9 @@ export class ReplayEngine {
      */
     private attempt: Attempt | null = null;
 
+    /** Bumped by `reset()`; a run of deliveries under an older value is stale. */
+    private generation = 0;
+
     constructor(deps: ReplayDeps) {
         this.deps = deps;
     }
@@ -102,7 +105,7 @@ export class ReplayEngine {
 
         // Past the cap the catch-up is abandoned rather than the traffic: the
         // buffer still flushes, so nothing live is lost — only the backlog is.
-        this.deps.onError(
+        this.report(
             new Error(
                 `Replay buffered more than ${BUFFER_CAP} live messages while catching up; the catch-up was abandoned.`,
             ),
@@ -134,6 +137,9 @@ export class ReplayEngine {
         this.cursor = null;
         this.buffer = [];
         this.attempt = null;
+        // Stops a run of deliveries this was called from mid-way through:
+        // finishing it would re-anchor the cursor just cleared here.
+        this.generation += 1;
 
         if (attempt) {
             attempt.done = true;
@@ -209,7 +215,7 @@ export class ReplayEngine {
 
             // Reported *and* resolved: the auto path is driven by a state
             // handler with nobody to catch a rejection.
-            this.deps.onError(error);
+            this.report(error);
             this.finish(attempt, incomplete());
         }
     }
@@ -293,9 +299,7 @@ export class ReplayEngine {
         const buffered = new Set(this.buffer.map((message) => message.id));
         const missed = messages.filter((message) => !buffered.has(message.id));
 
-        missed.forEach((message) => this.deliver(message));
-
-        return missed.length;
+        return this.deliverAll(missed);
     }
 
     /**
@@ -318,14 +322,66 @@ export class ReplayEngine {
         this.buffer = [];
         this.attempt = null;
 
-        buffered.forEach((message) => this.deliver(message));
+        try {
+            this.deliverAll(buffered);
+        } finally {
+            // Whatever the drain did, the caller hears an answer: this is the
+            // only place an attempt is ever settled, and `run()` has already
+            // marked it done, so a throw escaping here would hang it for good.
+            attempt.settle(result);
+        }
+    }
 
-        attempt.settle(result);
+    /**
+     * Hand a run of messages to the app, in order, and report how many got
+     * there.
+     *
+     * `dispatch` reaches the app's listeners, which are user code: one of them
+     * throwing is reported and stepped over rather than allowed to abandon the
+     * messages behind it. One of them calling `reset()` does end the run — the
+     * channel is being torn down, and delivering the rest would re-anchor the
+     * cursor `reset()` just cleared.
+     */
+    private deliverAll(messages: ReplayMessage[]): number {
+        const generation = this.generation;
+        let delivered = 0;
+
+        for (const message of messages) {
+            if (this.generation !== generation) {
+                break;
+            }
+
+            this.deliver(message);
+            delivered += 1;
+        }
+
+        return delivered;
     }
 
     /** Cursor first, then the app. */
     private deliver(message: ReplayMessage): void {
         this.noteDelivered(message);
-        this.deps.dispatch(message);
+
+        try {
+            this.deps.dispatch(message);
+        } catch (error) {
+            this.report(error);
+        }
+    }
+
+    /**
+     * Report a failure to the channel.
+     *
+     * `onError` ends up in the app's `error()` callbacks, which are user code
+     * on the same footing as its listeners: one of them throwing must not
+     * strand a catch-up mid-flush, and there is nowhere left to report a
+     * failure of the failure reporter to.
+     */
+    private report(error: unknown): void {
+        try {
+            this.deps.onError(error);
+        } catch {
+            // Deliberately dropped, per the note above.
+        }
     }
 }
