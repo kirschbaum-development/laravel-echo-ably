@@ -6,6 +6,8 @@ import type {
     AblyChannel,
     AblyPresenceChannel,
     AblyPrivateChannel,
+    ReplayOptions,
+    ReplayResult,
     RequestTokenFn,
 } from "../../src/index";
 import { AblyConnector, parseJwt } from "../../src/index";
@@ -51,9 +53,10 @@ const RUN = Math.random().toString(36).slice(2, 10);
  * The unit suite mocks ably-js, so it can only prove the driver behaves against
  * the mock's idea of Ably. This file is the thin check that the idea is right:
  * that a message published elsewhere reaches an Echo `listen()` callback, that
- * a whisper crosses between two clients, and that a presence channel really
- * does go attached → enter → `here()` with the member data the auth response
- * carried.
+ * a whisper crosses between two clients, that a presence channel really does go
+ * attached → enter → `here()` with the member data the auth response carried,
+ * and that a real continuity gap — a detach with traffic published behind it —
+ * is healed out of Ably's own history by the replay engine.
  *
  * Run with `npm run test:integration` and `ABLY_SANDBOX_KEY` set.
  */
@@ -72,12 +75,17 @@ describe.skipIf(!SANDBOX_KEY)("ably sandbox", () => {
      * same HS256 JWT the Laravel package returns from `/broadcasting/auth`,
      * accreting capability onto whatever token the driver already holds.
      */
-    function createEcho(clientId: string, info?: unknown) {
+    function createEcho(
+        clientId: string,
+        info?: unknown,
+        replay?: ReplayOptions,
+    ) {
         const echo = new Echo({
             broadcaster: AblyConnector,
             ably: {
                 clientOptions: { ...ENDPOINT_OPTIONS },
                 requestTokenFn: broadcasterStub(clientId, info),
+                replay,
             },
         });
 
@@ -208,6 +216,68 @@ describe.skipIf(!SANDBOX_KEY)("ably sandbox", () => {
         },
         TEST_TIMEOUT_MS,
     );
+
+    it(
+        "replays the events published while the channel was detached",
+        async () => {
+            const echo = createEcho("replay-subscriber", undefined, true);
+            const channel = echo.private(`replay-${RUN}`) as AblyPrivateChannel;
+            const events = collector<unknown>();
+            const outcomes = collector<ReplayResult>();
+
+            channel.listen("OrderShipped", (payload: unknown) =>
+                events.push(payload),
+            );
+            channel.recovered((result) => outcomes.push(result));
+
+            await attached(channel);
+
+            const publisher = createRawClient().channels.get(
+                `private:replay-${RUN}`,
+            );
+
+            // A catch-up is anchored on the last message the app saw, so the
+            // gap below needs one delivered ahead of it to query back to.
+            await publisher.publish("App\\Events\\OrderShipped", { id: 1 });
+
+            await expect(
+                withTimeout(events.first(1), "the anchor event"),
+            ).resolves.toEqual([{ id: 1 }]);
+
+            // A detach ends the attachment outright, so the re-attach below is
+            // the real thing the engine watches for: `resumed: false` with
+            // traffic published behind it.
+            await channel.subscription.detach();
+
+            for (const id of [2, 3, 4]) {
+                await publisher.publish("App\\Events\\OrderShipped", { id });
+            }
+
+            await channel.subscription.attach();
+
+            await expect(
+                withTimeout(events.first(4), "the replayed events"),
+            ).resolves.toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }]);
+
+            await expect(
+                withTimeout(outcomes.first(1), "the recovered callback"),
+            ).resolves.toEqual([{ complete: true, count: 3 }]);
+
+            // The manual path over a channel with nothing left to miss: the
+            // same engine, the forwards query, and an honest zero.
+            await expect(
+                withTimeout(channel.replayMissed(), "the manual catch-up"),
+            ).resolves.toEqual({ complete: true, count: 0 });
+
+            await expect(
+                withTimeout(outcomes.first(2), "the second recovered callback"),
+            ).resolves.toEqual([
+                { complete: true, count: 3 },
+                { complete: true, count: 0 },
+            ]);
+        },
+        TEST_TIMEOUT_MS,
+    );
 });
 
 /**
@@ -305,6 +375,46 @@ async function attached(channel: AblyChannel): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(channel.subscription.state).toBe("attached");
+}
+
+/**
+ * A sink for values that arrive one at a time, handing out a promise per "the
+ * first n have landed" mark — what an ordered-delivery assertion needs, where
+ * `deferred` only ever carries the one value.
+ */
+function collector<T>(): {
+    push: (value: T) => void;
+    first: (count: number) => Promise<T[]>;
+} {
+    const values: T[] = [];
+    let waiting: { count: number; resolve: (values: T[]) => void }[] = [];
+
+    const drain = () => {
+        waiting = waiting.filter(({ count, resolve }) => {
+            if (values.length < count) {
+                return true;
+            }
+
+            resolve(values.slice(0, count));
+
+            return false;
+        });
+    };
+
+    return {
+        push(value: T) {
+            values.push(value);
+
+            drain();
+        },
+        first(count: number) {
+            return new Promise<T[]>((resolve) => {
+                waiting.push({ count, resolve });
+
+                drain();
+            });
+        },
+    };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
