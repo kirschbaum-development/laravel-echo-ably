@@ -98,6 +98,7 @@ new Echo({
         client: undefined, // a pre-built Realtime instance
         requestTokenFn: undefined, // replaces the built-in auth request
         channelOptions: {}, // resolved channel name → Ably.ChannelOptions
+        replay: false, // replay the events a lost attachment missed
     },
 });
 ```
@@ -108,6 +109,7 @@ new Echo({
 | `client`         | `Ably.Realtime`                                           | Use a client you built yourself, instead of one the driver builds.                 |
 | `requestTokenFn` | `(channelName, existingToken) => Promise<{token, info?}>` | Replaces the driver's own request to `authEndpoint`.                               |
 | `channelOptions` | `Record<string, Ably.ChannelOptions>`                     | Per-channel Ably options, keyed by **resolved** channel name (`"private:orders"`). |
+| `replay`         | `boolean \| {limit?: number}`                             | Opt into replaying missed events after a continuity gap — see below.               |
 
 ### `clientOptions`
 
@@ -182,6 +184,115 @@ new Echo({
 ```
 
 `Echo.private('orders')` resolves to `private:orders`, `Echo.join('chat')` to `presence:chat`, `Echo.channel('ticker')` to `public:ticker`. This is also how you reach `modes`, `params` and deltas — anything `ably.channels.get(name, options)` accepts.
+
+## Replaying missed events
+
+Ably keeps a connection's state for about two minutes. A drop shorter than that _resumes_: ably-js re-attaches with continuity intact, Ably itself re-delivers whatever the connection missed, and none of this section applies. Past that window the resume fails, the channel re-attaches without continuity, and everything published in the meantime is gone as far as the client is concerned.
+
+`replay` closes that hole. The driver notices the re-attach that lost continuity, reads the missed messages back out of Ably's history, and pushes them through the listeners you already registered — in order, ahead of the live traffic that arrived behind them. Replayed messages take the same route a live one does, so `listen`, `listenToAll`, `listenForWhisper` and `notification` callbacks see no difference.
+
+```ts
+new Echo({
+    broadcaster: AblyConnector,
+    ably: { replay: true },
+});
+```
+
+It is off by default, and off means nothing changes: no cursor is tracked, no history request is ever made, `recovered()` never fires and `replayMissed()` rejects. (This is not `rewind`, which is a `channelOptions` param that hands _every_ new subscriber the last N messages regardless of what it has already seen. Replay is scoped to the one gap this client had.)
+
+`limit` caps how many messages a single catch-up may replay. It defaults to 100, and a value below 1 falls back to that default:
+
+```ts
+new Echo({
+    broadcaster: AblyConnector,
+    ably: { replay: { limit: 250 } },
+});
+```
+
+The package exports `ReplayOptions` (the config) and `ReplayResult` (`{complete, count}`) for annotating your own handlers.
+
+### `recovered()`
+
+Every catch-up attempt reports its outcome to the channel's `recovered()` callbacks — whether it healed the channel or not:
+
+```js
+Echo.private(`orders.${orderId}`)
+    .listen("OrderShipped", (event) => store.apply(event))
+    .recovered(({ complete, count }) => {
+        if (!complete) {
+            return store.refetch(); // The gap stands; reload from the server.
+        }
+
+        console.log(`Replayed ${count} missed events`);
+    });
+```
+
+One call per attempt: a gap detected while a catch-up is already running joins that one rather than starting a second, and the single result is fanned out once. Registrations are dropped when the channel is left (`Echo.leave()`, `Echo.leaveChannel()`), the same as `listen()` registrations.
+
+### `replayMissed()`
+
+Not every gap announces itself as a lost attachment. A phone that slept and woke, a mobile browser tab thawed after being frozen — the connection may come back believing it is fine while the app knows it has been away. Ask for a catch-up directly:
+
+```js
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+        Echo.private(`orders.${orderId}`).replayMissed();
+    }
+});
+```
+
+It resolves with the same `{complete, count}` result the callbacks receive, and fires them too. It rejects for exactly one reason — replay is not configured on this connection; a catch-up that _fails_ is not an exception, it resolves `{complete: false, count: 0}` like any other unhealed gap.
+
+### Nothing is replayed halfway
+
+`complete: false` means the driver could not account for everything that was missed, and in that case it replays **nothing**: `count` is always `0`. A backlog with a hole in it is worse than an honest miss, because the app has no way to know which events are absent. `complete: false` tells it the one thing it can act on: refetch state from the server.
+
+A catch-up reports `{complete: false, count: 0}` when:
+
+- the missed run is longer than `limit`, or reaches further back than history goes;
+- the history request itself fails (see the capability note below);
+- nothing has been delivered on the channel yet, so there is no cursor to catch up from;
+- more than 1000 live messages piled up behind the catch-up while it ran. The catch-up is abandoned rather than the traffic — the buffered live messages are still delivered — and the abandonment is also reported through `error()`.
+
+### How far back history goes
+
+A catch-up can only return what Ably still holds:
+
+| Channel setup                      | History window |
+| ---------------------------------- | -------------- |
+| Default — no persistence           | ~2 minutes     |
+| Persist all messages, free package | 24 hours       |
+| Persist all messages, paid package | 72 hours       |
+
+"Persist all messages" is a channel rule you add in the Ably dashboard, matched against a channel _namespace_ — the part before the first `:`. This driver namespaces every channel by kind (`public:orders`, `private:orders`, `presence:chat`), so a rule on `private` covers every private channel the app opens. Ably's [message storage docs](https://ably.com/docs/storage-history/storage) are the authority on the retention numbers for your package.
+
+The default window is worth a second thought: it is the same two minutes as the resume window. A gap the driver detects is by definition one that outlived the resume window — and un-persisted history has expired right along with it, so the catch-up will honestly report `complete: false` and your app will refetch. Turn persistence on for the namespaces you want auto-replay to actually heal.
+
+### The `history` capability
+
+A catch-up is a history request, so the token has to grant `history` on the channel. `ably/laravel-broadcaster` grants it by default and there is nothing to do: guarded channels are signed with `["*"]`, and public channels with `["subscribe", "history", "channel-metadata"]`.
+
+It only becomes a question when a channel authorization callback returns its own `ably-capability`, which _replaces_ that `["*"]` default for the channel:
+
+```php
+Broadcast::channel('orders.{orderId}', function ($user, $orderId) {
+    return [
+        // Replaces the default ["*"] for this channel, so a catch-up on it
+        // needs 'history' to be in the list.
+        'ably-capability' => ['subscribe', 'history'],
+    ];
+});
+```
+
+A history request the token does not authorize is delivered to the channel's `error()` callbacks as an Ably `ErrorInfo`, and the catch-up resolves `{complete: false, count: 0}`. The automatic path never rejects — there would be nobody to catch it.
+
+### Presence is not replayed
+
+Presence events are not message history and are never replayed. They do not need to be: `here()` re-reads the full member list on every successful attach, and the driver re-enters the presence set on re-attach, so a presence channel heals its own state on the very re-attach that triggers the catch-up. Regular events published on a presence channel replay like they do anywhere else.
+
+### A listener that throws does not abort the replay
+
+Replay dispatches through your own callbacks, and one of them throwing does not abandon the run: the error is reported to the channel's `error()` callbacks and the messages behind it are delivered anyway. Neither a `listen` nor a `listenToAll` callback can strand the rest of the backlog.
 
 ## React and Vue hooks
 
@@ -315,7 +426,7 @@ The built-in broadcaster is `pusher-js` against Ably's Pusher-protocol adapter. 
 
 - **Encrypted private channels.** `Echo.encryptedPrivate()` throws for any non-Pusher connector — Echo's core gates it with an `instanceof` check on its own connectors, so no third-party driver can implement it today.
 - **Typed hooks.** `configureEcho({broadcaster: AblyConnector})` needs a suppression until the upstream `laravel/echo` typing PRs land.
-- **A replay / `recovered` API.** Use `channelOptions` with `rewind` in the meantime.
+- **Page-reload recovery.** Replay heals a live connection's gap; it does not carry a cursor across a page load. Ably's own connection `recover` key is available through `clientOptions` if you need it.
 - **Connections that only ever use public channels.** Supply a token through `clientOptions`, or a self-authenticating `client` — see the note above, and [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
 
 Progress and requests: [github.com/kirschbaum-development/laravel-echo-ably/issues](https://github.com/kirschbaum-development/laravel-echo-ably/issues).
