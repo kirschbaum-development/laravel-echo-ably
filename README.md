@@ -185,6 +185,8 @@ new Echo({
 
 `Echo.private('orders')` resolves to `private:orders`, `Echo.join('chat')` to `presence:chat`, `Echo.channel('ticker')` to `public:ticker`. This is also how you reach `modes`, `params` and deltas — anything `ably.channels.get(name, options)` accepts.
 
+`rewind` hands every new subscriber the same last N messages. To fill the gap one client actually missed, see [Replaying missed events](#replaying-missed-events) below.
+
 ## Replaying missed events
 
 Ably keeps a connection's state for about two minutes. A drop shorter than that _resumes_: ably-js re-attaches with continuity intact, Ably itself re-delivers whatever the connection missed, and none of this section applies. Past that window the resume fails, the channel re-attaches without continuity, and everything published in the meantime is gone as far as the client is concerned.
