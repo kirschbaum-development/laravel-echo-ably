@@ -36,6 +36,26 @@ jobs:
 
             - run: npm run build
 
+    package:
+        runs-on: ubuntu-latest
+
+        name: Packaging
+
+        # `dist/` is gitignored and rebuilt by `prepack`, so nothing but a real
+        # pack from a clean checkout can prove the published tarball is whole.
+        # This job is the regression test for shipping an empty package.
+        steps:
+            - uses: actions/checkout@v6
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - run: npm ci
+
+            - run: npm run verify:package
+
     integration:
         runs-on: ubuntu-latest
 

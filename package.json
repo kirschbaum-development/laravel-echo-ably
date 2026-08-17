@@ -34,20 +34,22 @@
     },
     "scripts": {
         "build": "vite build",
+        "prepack": "npm run build",
         "lint": "eslint --config eslint.config.js \"src/**/*.ts\" \"tests/**/*.ts\"",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
         "test:watch": "vitest",
-        "test:integration": "vitest run --config vitest.integration.config.ts"
+        "test:integration": "vitest run --config vitest.integration.config.ts",
+        "verify:package": "bash scripts/verify-package.sh"
     },
     "engines": {
         "node": ">=20"
     },
     "peerDependencies": {
         "ably": "^2.0",
-        "laravel-echo": "^2.3.0"
+        "laravel-echo": "^2.3.7"
     },
     "devDependencies": {
         "@typescript-eslint/eslint-plugin": "^8.67.0",
