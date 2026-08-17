@@ -13,6 +13,7 @@ export type {
 } from "./replay/types";
 export type {
     AblyDriverOptions,
+    ContinuityLostEvent,
     EchoOptionsWithDefaults,
     RequestTokenFn,
     TokenResponse,

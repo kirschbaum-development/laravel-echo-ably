@@ -248,7 +248,36 @@ export class AblyConnector extends Connector<
     }
 
     /**
+     * Subscribe to ably's own connection state changes, unmapped.
+     *
+     * `onConnectionChange` answers Echo's contract, which has four statuses
+     * where ably has eight and no room at all for the `reason` — so a 42913 on
+     * `[meta]connection.lifecycle`, or the 80019 behind a failed auth, arrives
+     * there as a bare `"reconnecting"`. This is the same feed with everything
+     * ably attached to it left on: state, previous state, `reason.code`,
+     * `reason.statusCode`.
+     *
+     * Returns an unsubscriber, like `onConnectionChange` does.
+     */
+    onConnectionStateChange(
+        callback: (change: ConnectionStateChange) => void,
+    ): () => void {
+        const listener = (change: ConnectionStateChange) => callback(change);
+
+        this.ably.connection.on(listener);
+
+        return () => this.ably.connection.off(listener);
+    }
+
+    /**
      * Disconnect from the Echo server.
+     *
+     * Closes the client this connector is driving — including one the
+     * application injected through `ably.client`, which is deliberate: Echo's
+     * contract is that `disconnect()` ends the connection, and a connector that
+     * quietly left a socket open would leak one per Echo instance. An app that
+     * wants to keep an injected client alive past `Echo.disconnect()` should
+     * hold its own reference and reconnect it.
      */
     disconnect(): void {
         this.ably.close();

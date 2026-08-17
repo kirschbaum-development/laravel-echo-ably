@@ -16,7 +16,11 @@ import type {
     ReplayMessage,
     ReplayResult,
 } from "../replay/types";
-import type { AblyDriverOptions, EchoOptionsWithDefaults } from "../types";
+import type {
+    AblyDriverOptions,
+    ContinuityLostEvent,
+    EchoOptionsWithDefaults,
+} from "../types";
 
 /**
  * The slice of a message the routing path reads.
@@ -38,7 +42,8 @@ type InboundListener = (message: InboundMessage) => void;
 type StateListener = (change: ChannelStateChange) => void;
 
 /**
- * The live channel instances sharing each underlying ably channel.
+ * The live channel instances sharing each underlying ably channel, by client
+ * and resolved name.
  *
  * `channels.get(name)` caches, so a leave→rejoin on the same name — React
  * StrictMode's mount → cleanup → mount, most commonly — puts two instances of
@@ -49,9 +54,16 @@ type StateListener = (change: ChannelStateChange) => void;
  * detach landing after the successor's attach would leave that successor
  * silently unattached.
  *
- * Keyed weakly, so an entry lives exactly as long as the ably channel does.
+ * Keyed by name rather than by `RealtimeChannel` so that an instance can claim
+ * its place synchronously, in the constructor, before it has a channel object
+ * to be keyed by. A successor is created on the same tick as the leave that
+ * preceded it, while the predecessor's teardown is queued behind the ready
+ * promise — so a claim that waited for the channel would be too late, and the
+ * teardown would detach a channel the successor was about to use.
+ *
+ * Keyed weakly on the client, so entries live exactly as long as it does.
  */
-const liveInstances = new WeakMap<RealtimeChannel, Set<AblyChannel>>();
+const liveInstances = new WeakMap<Realtime, Map<string, Set<AblyChannel>>>();
 
 /**
  * A public Ably channel, driven by Echo's channel contract.
@@ -109,6 +121,10 @@ export class AblyChannel extends Channel {
 
     private readonly recoveredCallbacks: Array<(result: ReplayResult) => void> =
         [];
+
+    private readonly continuityCallbacks: Array<
+        (event: ContinuityLostEvent) => void
+    > = [];
 
     /**
      * Whether this channel has ever reached `attached`. The first attach
@@ -176,6 +192,10 @@ export class AblyChannel extends Channel {
         this.engine = replay.enabled ? this.createEngine(replay.limit) : null;
         this.eventFormatter = new EventFormatter(this.options.namespace);
 
+        // Before the first await, so a leave→rejoin on this tick finds this
+        // instance already registered.
+        this.claimInstance();
+
         this.ready = this.subscribe();
     }
 
@@ -204,8 +224,6 @@ export class AblyChannel extends Channel {
             // attach: no catch-up, and no `recovered()` telling the app to
             // refetch.
             this.hasAttachedBefore ||= this.subscription.state === "attached";
-
-            this.claimInstance(this.subscription);
 
             // One listener for the life of the ably channel: `subscribe()` runs
             // again on connection recovery, and a second registration would
@@ -258,6 +276,7 @@ export class AblyChannel extends Channel {
         // The registrations go first: resetting settles a catch-up still in
         // flight, and its result belongs to nobody now.
         this.recoveredCallbacks.length = 0;
+        this.continuityCallbacks.length = 0;
         this.engine?.reset();
 
         this.whenReady((channel) => {
@@ -289,12 +308,12 @@ export class AblyChannel extends Channel {
                 this.stateListener = null;
             }
 
-            liveInstances.get(channel)?.delete(this);
+            this.releaseInstance();
 
             // A successor instance is attached to the very same channel, and
             // ably has no notion of two attach intents: detaching now would
             // strand it.
-            if (this.sharedWithLiveInstance(channel)) {
+            if (this.sharedWithLiveInstance()) {
                 return undefined;
             }
 
@@ -439,6 +458,28 @@ export class AblyChannel extends Channel {
     }
 
     /**
+     * Register a callback for a break in message continuity.
+     *
+     * Fires for every channel state change that reports `resumed: false` —
+     * ably's `attached` after a disconnection outlived the resume window, and
+     * its `update` when continuity is lost while the channel stays attached —
+     * except the channel's very first attach, which has nothing behind it to
+     * have missed.
+     *
+     * Independent of `replay`: it fires whether or not a catch-up is
+     * configured, and always *before* one starts. An application that recovers
+     * from its own authoritative snapshot needs the news immediately, not after
+     * a history round-trip, which is what separates this from `recovered()`.
+     *
+     * Cleared by `unsubscribe()`, like the listeners are.
+     */
+    continuityLost(callback: (event: ContinuityLostEvent) => void): this {
+        this.continuityCallbacks.push(callback);
+
+        return this;
+    }
+
+    /**
      * Catch up on whatever was missed since the last delivered message, on
      * demand — a backgrounded tab coming back, most commonly.
      *
@@ -545,8 +586,8 @@ export class AblyChannel extends Channel {
      * instances the same object. Anything that would affect the channel as a
      * whole belongs to the last instance out.
      */
-    protected sharedWithLiveInstance(channel: RealtimeChannel): boolean {
-        const instances = liveInstances.get(channel);
+    protected sharedWithLiveInstance(): boolean {
+        const instances = liveInstances.get(this.ably)?.get(this.name);
 
         if (!instances) {
             return false;
@@ -631,11 +672,47 @@ export class AblyChannel extends Channel {
 
         this.hasAttachedBefore = true;
 
-        if (!this.engine || !attachedBefore || change.resumed !== false) {
+        if (!attachedBefore || change.resumed !== false) {
+            return;
+        }
+
+        // Announced first, and whether or not there is a catch-up to follow it:
+        // an app recovering from its own snapshot has to hear about the gap on
+        // this tick, where `recovered()` cannot reach it until history answers.
+        this.dispatchContinuityLost(change);
+
+        if (!this.engine) {
             return;
         }
 
         void this.fanOut(this.engine.gapDetected());
+    }
+
+    /**
+     * Hand a continuity gap to every registered callback.
+     *
+     * Isolated one by one, the way the `recovered` fan-out is: these are user
+     * code, the news was promised to all of them, and a throw is reported
+     * through `error()` rather than skipping the registrations behind it.
+     */
+    private dispatchContinuityLost(change: ChannelStateChange): void {
+        const event: ContinuityLostEvent = {
+            channel: this.name,
+            stateChange: change,
+            reason: change.reason,
+            willReplay: this.engine !== null,
+        };
+
+        // Copied for the reason `routeMessage` copies: a callback that leaves
+        // the channel from inside its own delivery must not disturb the run it
+        // is part of.
+        [...this.continuityCallbacks].forEach((callback) => {
+            try {
+                callback(event);
+            } catch (error) {
+                this.dispatchError(error);
+            }
+        });
     }
 
     /**
@@ -697,12 +774,31 @@ export class AblyChannel extends Channel {
         this.whenReady(operation);
     }
 
-    /** Record this instance as a user of the underlying ably channel. */
-    private claimInstance(channel: RealtimeChannel): void {
-        const instances = liveInstances.get(channel) ?? new Set<AblyChannel>();
+    /** Record this instance as a user of the channel this name resolves to. */
+    private claimInstance(): void {
+        const byName =
+            liveInstances.get(this.ably) ?? new Map<string, Set<AblyChannel>>();
+        const instances = byName.get(this.name) ?? new Set<AblyChannel>();
 
         instances.add(this);
-        liveInstances.set(channel, instances);
+        byName.set(this.name, instances);
+        liveInstances.set(this.ably, byName);
+    }
+
+    /** Give up this instance's claim, leaving the last one out to detach. */
+    private releaseInstance(): void {
+        const byName = liveInstances.get(this.ably);
+        const instances = byName?.get(this.name);
+
+        if (!byName || !instances) {
+            return;
+        }
+
+        instances.delete(this);
+
+        if (instances.size === 0) {
+            byName.delete(this.name);
+        }
     }
 
     /**

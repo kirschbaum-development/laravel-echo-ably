@@ -426,6 +426,191 @@ describe("AblyChannel", () => {
         });
     });
 
+    describe("continuityLost", () => {
+        /** The state change a re-attach that could not resume carries. */
+        const GAP = {
+            current: "attached",
+            previous: "suspended",
+            resumed: false,
+        };
+
+        /**
+         * What ably emits as an `update` when an ATTACHED arrives unresumed on
+         * an already-attached channel: `previous` equals `current`, and the
+         * driver's catch-all state listener is what receives it.
+         */
+        const UPDATE_GAP = {
+            current: "attached",
+            previous: "attached",
+            resumed: false,
+        };
+
+        it("fires on a re-attach that lost continuity, with replay disabled", async () => {
+            const { channel, underlying } = setup();
+            const lost = vi.fn();
+
+            channel.continuityLost(lost);
+            await settle(channel);
+
+            underlying().emitStateChange(GAP);
+
+            expect(lost).toHaveBeenCalledTimes(1);
+        });
+
+        it("fires on an update that reports lost continuity", async () => {
+            const { channel, underlying } = setup();
+            const lost = vi.fn();
+
+            channel.continuityLost(lost);
+            await settle(channel);
+
+            underlying().emitStateChange(UPDATE_GAP);
+
+            expect(lost).toHaveBeenCalledTimes(1);
+        });
+
+        it("does not fire on the first attach, though ably reports it unresumed", async () => {
+            const { channel } = setup();
+            const lost = vi.fn();
+
+            channel.continuityLost(lost);
+            await settle(channel);
+
+            expect(lost).not.toHaveBeenCalled();
+        });
+
+        it("does not fire when the re-attach resumed the previous one", async () => {
+            const { channel, underlying } = setup();
+            const lost = vi.fn();
+
+            channel.continuityLost(lost);
+            await settle(channel);
+
+            underlying().emitStateChange({ ...GAP, resumed: true });
+
+            expect(lost).not.toHaveBeenCalled();
+        });
+
+        it("carries the channel name, the state change and ably's reason", async () => {
+            const { channel, underlying } = setup();
+            const reason = {
+                code: 90003,
+                statusCode: 400,
+                message: "Unable to recover channel because messages expired",
+            };
+            const events: unknown[] = [];
+
+            channel.continuityLost((event: unknown) => events.push(event));
+            await settle(channel);
+
+            underlying().emitStateChange({ ...GAP, reason });
+
+            expect(events).toEqual([
+                {
+                    channel: NAME,
+                    stateChange: { ...GAP, reason },
+                    reason,
+                    willReplay: false,
+                },
+            ]);
+        });
+
+        it("reports no reason when ably attached none to the gap", async () => {
+            const { channel, underlying } = setup();
+            const events: Array<{ reason: unknown }> = [];
+
+            channel.continuityLost((event: { reason: unknown }) =>
+                events.push(event),
+            );
+            await settle(channel);
+
+            underlying().emitStateChange(GAP);
+
+            expect(events[0].reason).toBeUndefined();
+        });
+
+        it("reports willReplay when a catch-up is configured", async () => {
+            const { channel, underlying } = setup({
+                replay: { enabled: true, limit: 100 },
+            });
+            const events: Array<{ willReplay: boolean }> = [];
+
+            channel.continuityLost((event: { willReplay: boolean }) =>
+                events.push(event),
+            );
+            await settle(channel);
+
+            underlying().emitStateChange(GAP);
+
+            expect(events[0].willReplay).toBe(true);
+        });
+
+        it("fires before the catch-up it precedes has queried anything", async () => {
+            const { channel, underlying } = setup({
+                replay: { enabled: true, limit: 100 },
+            });
+            const order: string[] = [];
+
+            channel.continuityLost(() => order.push("continuityLost"));
+            await settle(channel);
+
+            underlying().history.mockImplementation(() => {
+                order.push("history");
+
+                return Promise.resolve({
+                    items: [],
+                    hasNext: () => false,
+                    next: () => Promise.resolve(null),
+                });
+            });
+            underlying().emitMessage({
+                name: "App\\Events\\OrderShipped",
+                data: { id: 1 },
+                id: "m1",
+                timestamp: 1000,
+            });
+            underlying().emitStateChange(GAP);
+            await settle(channel);
+
+            // The app can show a recovering state on the same tick as the gap,
+            // rather than waiting a history round-trip for `recovered()`.
+            expect(order).toEqual(["continuityLost", "history"]);
+        });
+
+        it("fires every registration, even when one of them throws", async () => {
+            const { channel, underlying } = setup();
+            const second = vi.fn();
+            const errors: unknown[] = [];
+            const boom = new Error("listener blew up");
+
+            channel.error((error: unknown) => errors.push(error));
+            channel.continuityLost(() => {
+                throw boom;
+            });
+            channel.continuityLost(second);
+            await settle(channel);
+
+            underlying().emitStateChange(GAP);
+
+            expect(second).toHaveBeenCalledTimes(1);
+            expect(errors).toEqual([boom]);
+        });
+
+        it("drops its registrations when the channel is left", async () => {
+            const { channel, underlying } = setup();
+            const lost = vi.fn();
+
+            channel.continuityLost(lost);
+            await settle(channel);
+
+            channel.unsubscribe();
+            await settle(channel);
+            underlying().emitStateChange(GAP);
+
+            expect(lost).not.toHaveBeenCalled();
+        });
+    });
+
     describe("onChannelFailed", () => {
         it("lets the hook claim a failure that also rejects the attach", async () => {
             const reason = { code: 40160, message: "not permitted" };
@@ -495,6 +680,24 @@ describe("AblyChannel", () => {
             expect(subscribed).not.toHaveBeenCalled();
             expect(message).not.toHaveBeenCalled();
             expect(global).not.toHaveBeenCalled();
+        });
+
+        it("detaches even when another client holds a channel of the same name", async () => {
+            // Instances are tracked by resolved name, so the registry has to be
+            // scoped per client: two Echo connections in one tab both open
+            // `private:orders`, and neither may keep the other's teardown from
+            // detaching.
+            const mine = setup();
+            const theirs = setup();
+
+            await settle(mine.channel);
+            await settle(theirs.channel);
+
+            mine.channel.unsubscribe();
+            await settle(mine.channel);
+
+            expect(mine.underlying().detach).toHaveBeenCalledTimes(1);
+            expect(theirs.underlying().detach).not.toHaveBeenCalled();
         });
 
         it("leaves the state listener re-registerable when it races a pending subscribe", async () => {

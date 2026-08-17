@@ -655,7 +655,9 @@ describe("coalescing", () => {
 
         inFlight.resolve(pages([anchor]));
 
-        await expect(first).resolves.toEqual({ complete: true, count: 0 });
+        // Incomplete because the second `gapDetected()` superseded the walk —
+        // one attempt and one result, but an honest one.
+        await expect(first).resolves.toEqual({ complete: false, count: 0 });
     });
 
     it("starts a fresh attempt once the previous one has settled", async () => {
@@ -669,6 +671,88 @@ describe("coalescing", () => {
 
         await expect(second).resolves.toEqual(first);
         expect(harness.history).toHaveBeenCalledTimes(2);
+    });
+
+    it("reports incomplete when a second gap lands while the walk runs", async () => {
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+
+        const attempt = harness.engine.gapDetected();
+
+        // A `untilAttach` walk is anchored to the attach point it left under,
+        // so it cannot see anything published during a *second* outage. The
+        // answer it is about to give is no longer one it can back up.
+        harness.engine.gapDetected();
+
+        inFlight.resolve(pages([message("m1", 10), anchor]));
+
+        await expect(attempt).resolves.toEqual({
+            complete: false,
+            count: 0,
+        });
+    });
+
+    it("replays nothing from a walk a second gap superseded", async () => {
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+
+        const attempt = harness.engine.gapDetected();
+
+        harness.engine.gapDetected();
+
+        inFlight.resolve(pages([message("m1", 10), anchor]));
+        await attempt;
+
+        // The no-partial rule: the backlog this walk did collect is a prefix of
+        // what was actually missed, and a prefix is worse than an honest miss.
+        expect(delivered(harness)).toEqual([]);
+    });
+
+    it("still flushes live traffic buffered behind a superseded walk", async () => {
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+
+        const attempt = harness.engine.gapDetected();
+        const live = message("m9", 90);
+
+        harness.engine.handleMessage(live);
+        harness.engine.gapDetected();
+
+        inFlight.resolve(pages([anchor]));
+        await attempt;
+
+        // Only the backlog is abandoned; nothing live is ever dropped.
+        expect(delivered(harness)).toEqual(["m9"]);
+    });
+
+    it("keeps a manual catch-up joining a gap complete", async () => {
+        const anchor = message("m0", 0);
+        const harness = anchoredEngine(anchor);
+        const inFlight = deferredPage();
+
+        harness.history.mockReturnValueOnce(inFlight.promise);
+
+        const attempt = harness.engine.gapDetected();
+
+        // `replayMissed()` reports no new outage — it is a caller asking about
+        // the same gap, so the running walk still answers for all of it.
+        harness.engine.replayMissed();
+
+        inFlight.resolve(pages([message("m1", 10), anchor]));
+
+        await expect(attempt).resolves.toEqual({
+            complete: true,
+            count: 1,
+        });
     });
 });
 

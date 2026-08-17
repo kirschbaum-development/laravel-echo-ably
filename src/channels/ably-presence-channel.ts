@@ -107,7 +107,7 @@ export class AblyPresenceChannel
             // set as the same client: leaving now would take its membership
             // with it, so the last instance out does the leaving. Failures are
             // not reported, the way the base treats a refused `detach()`.
-            const left = this.sharedWithLiveInstance(channel)
+            const left = this.sharedWithLiveInstance()
                 ? undefined
                 : channel.presence.leave();
 

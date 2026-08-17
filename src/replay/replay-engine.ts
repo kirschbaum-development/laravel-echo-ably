@@ -30,6 +30,16 @@ type Attempt = {
     promise: Promise<ReplayResult>;
     settle: (result: ReplayResult) => void;
     done: boolean;
+    /**
+     * Whether a second continuity gap opened while this attempt was running.
+     *
+     * A gap-mode walk is anchored to the attach point in force when its request
+     * went out, so it cannot see anything published during a later outage. Its
+     * backlog is then a prefix of what was actually missed, and the answer it
+     * was about to give — `complete: true` — is the one that tells an app *not*
+     * to refetch.
+     */
+    superseded: boolean;
 };
 
 /** Read the `ably.replay` option, defaults filled in. */
@@ -163,6 +173,12 @@ export class ReplayEngine {
         // A second gap or a manual call joins the attempt already running: the
         // channel fans one result out to its `recovered` callbacks.
         if (this.attempt) {
+            // A *gap* joining is news, though: it says the channel went away
+            // again behind the running walk, which cannot have queried what was
+            // published in the meantime. A manual call reports no new outage
+            // and leaves the answer alone.
+            this.attempt.superseded ||= mode === "gap";
+
             return this.attempt.promise;
         }
 
@@ -171,7 +187,12 @@ export class ReplayEngine {
             settle = resolve;
         });
 
-        const attempt: Attempt = { promise, settle, done: false };
+        const attempt: Attempt = {
+            promise,
+            settle,
+            done: false,
+            superseded: false,
+        };
 
         this.attempt = attempt;
 
@@ -202,8 +223,10 @@ export class ReplayEngine {
             }
 
             // The no-partial rule: a backlog with a hole in it is worse than an
-            // honest miss, so an incomplete collection is thrown away.
-            if (!collected) {
+            // honest miss, so an incomplete collection is thrown away. A walk a
+            // later gap superseded is exactly that — whole up to its own attach
+            // point, and blind to everything after it.
+            if (!collected || attempt.superseded) {
                 this.finish(attempt, incomplete());
 
                 return;

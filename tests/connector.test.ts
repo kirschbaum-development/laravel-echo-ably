@@ -679,6 +679,39 @@ describe("AblyConnector", () => {
             expect(joined).toHaveBeenCalledWith({ id: 1 });
         });
 
+        it("does not detach when the predecessor had already settled", async () => {
+            // The other tests here catch the teardown mid-subscribe, where the
+            // successor claims the channel first. This is the ordinary React
+            // remount: the predecessor is fully attached before it is left, so
+            // its teardown is queued ahead of the successor's own `subscribe()`
+            // and used to win the race — detaching a channel the successor was
+            // about to use, and buying an avoidable `resumed: false` re-attach.
+            const { realtime, connector } = setup();
+            const first = connector.privateChannel("orders");
+
+            await settle(first);
+            await flush();
+
+            connector.leaveChannel("private-orders");
+
+            const second = connector.privateChannel("orders");
+            const message = vi.fn();
+
+            second.listen(".OrderShipped", message);
+
+            await settle(second);
+            await settle(first);
+            await flush();
+
+            const underlying = realtime.channels.all["private:orders"];
+
+            expect(underlying.detach).not.toHaveBeenCalled();
+
+            underlying.emitMessage({ name: "OrderShipped", data: { id: 1 } });
+
+            expect(message).toHaveBeenCalledWith({ id: 1 });
+        });
+
         it("detaches once the last instance of the channel has left", async () => {
             const { realtime, connector } = setup();
 
@@ -805,6 +838,47 @@ describe("AblyConnector", () => {
 
             expect(callback).toHaveBeenCalledTimes(1);
             expect(callback).toHaveBeenCalledWith("connected");
+        });
+    });
+
+    describe("onConnectionStateChange", () => {
+        it("hands over ably's own state change, reason and code intact", () => {
+            const { realtime, connector } = setup();
+            const changes: unknown[] = [];
+            // What a connection-lifecycle rate limit looks like: the code the
+            // mapped status can never carry.
+            const reason = {
+                code: 42913,
+                statusCode: 429,
+                message: "Rate limit exceeded on [meta]connection.lifecycle",
+            };
+
+            connector.onConnectionStateChange((change) => changes.push(change));
+
+            realtime.connection.emitStateChange({
+                current: "disconnected",
+                previous: "connected",
+                reason,
+            });
+
+            expect(changes).toEqual([
+                { current: "disconnected", previous: "connected", reason },
+            ]);
+        });
+
+        it("returns an unsubscriber that stops the reports", () => {
+            const { realtime, connector } = setup();
+            const callback = vi.fn();
+
+            const unsubscribe = connector.onConnectionStateChange(callback);
+
+            realtime.connection.emitStateChange({ current: "connected" });
+
+            unsubscribe();
+
+            realtime.connection.emitStateChange({ current: "closed" });
+
+            expect(callback).toHaveBeenCalledTimes(1);
         });
     });
 
