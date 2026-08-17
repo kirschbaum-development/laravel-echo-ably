@@ -11,7 +11,7 @@ This package is neither: it is a standalone connector that plugs into Echo 2.x's
 
 ## Requirements
 
-- `laravel-echo` ^2.3.0 and `ably` ^2.0 (both peer dependencies) — 2.3 is where Echo started exporting `ConnectionStatus`, which this package's types reference
+- `laravel-echo` ^2.3.7 and `ably` ^2.0 (both peer dependencies) — 2.3 is where Echo started exporting `ConnectionStatus`, which this package's types reference, and 2.3.7 is where `broadcaster` started accepting a third-party connector without a type suppression
 - Node 20+ for the build tooling; the package itself targets the browser
 - Laravel with [`ably/laravel-broadcaster`](https://github.com/ably/laravel-broadcaster) — the server side is **required**, because the driver authenticates with the Ably JWTs that package signs
 
@@ -187,6 +187,41 @@ new Echo({
 
 `rewind` hands every new subscriber the same last N messages. To fill the gap one client actually missed, see [Replaying missed events](#replaying-missed-events) below.
 
+## Knowing when continuity is lost
+
+Ably keeps a connection's state for about two minutes. A drop shorter than that _resumes_ and nothing is missed. Past that window the channel re-attaches **without continuity**, and everything published in the meantime is gone as far as this client is concerned — the screen keeps rendering state that is quietly out of date.
+
+`continuityLost()` is how the driver tells you that happened. It fires on every channel state change Ably marks `resumed: false` — both of the events [Ably's discontinuity guide](https://ably.com/docs/pub-sub/guides/handling-discontinuity) names:
+
+- an `attached` after a disconnection outlived the resume window;
+- an `update` when continuity breaks while the channel stays attached.
+
+The channel's very first attach is not a gap and never fires it: there is nothing behind it to have missed.
+
+```js
+Echo.private(`auctions.${auctionId}`)
+    .listen("BidPlaced", (event) => store.apply(event))
+    .continuityLost(({ reason }) => {
+        // The channel is live again, but there is a hole behind it.
+        store.markRecovering();
+
+        return store.refetchSnapshot(); // your server is the authority
+    });
+```
+
+It is **independent of `replay`**: it fires whether or not a catch-up is configured, and always _before_ one starts. That ordering is the point — `recovered()` cannot report anything until a history round-trip has finished, which is too late to put a "Reconnecting…" state on screen. If you use both, `continuityLost()` opens the recovering state and `recovered()` closes it.
+
+The callback receives:
+
+| Field         | Type                        | Notes                                                                              |
+| ------------- | --------------------------- | ---------------------------------------------------------------------------------- |
+| `channel`     | `string`                    | The resolved Ably name, e.g. `private:auctions.7`.                                 |
+| `stateChange` | `Ably.ChannelStateChange`   | Ably's own object, untouched — `current`, `previous`, `resumed`, `hasBacklog`.     |
+| `reason`      | `Ably.ErrorInfo｜undefined` | `stateChange.reason`. Where 90003 and 90005 turn up — **often absent**, see below. |
+| `willReplay`  | `boolean`                   | Whether a replay catch-up was started for this gap.                                |
+
+**Do not detect gaps by error code.** A re-attach that simply could not resume frequently carries no `reason` at all, so nothing reaches `error()` and no code is available to match on. `resumed: false` is the signal; 90003 and 90005 are extra detail when Ably chooses to send it. Registrations are dropped when the channel is left, the same as `listen()` registrations.
+
 ## Replaying missed events
 
 Ably keeps a connection's state for about two minutes. A drop shorter than that _resumes_: ably-js re-attaches with continuity intact, Ably itself re-delivers whatever the connection missed, and none of this section applies. Past that window the resume fails, the channel re-attaches without continuity, and everything published in the meantime is gone as far as the client is concerned.
@@ -200,7 +235,7 @@ new Echo({
 });
 ```
 
-It is off by default, and off means nothing changes: no cursor is tracked, no history request is ever made, `recovered()` never fires and `replayMissed()` rejects. (This is not `rewind`, which is a `channelOptions` param that hands _every_ new subscriber the last N messages regardless of what it has already seen. Replay is scoped to the one gap this client had.)
+It is off by default, and off means nothing changes: no cursor is tracked, no history request is ever made, `recovered()` never fires and `replayMissed()` rejects. [`continuityLost()`](#knowing-when-continuity-is-lost) still fires either way — an app that recovers from its own server snapshot needs no replay at all, and `replay: false` is the simpler contract: one signal, one refetch, no `history` capability required. (This is not `rewind`, which is a `channelOptions` param that hands _every_ new subscriber the last N messages regardless of what it has already seen. Replay is scoped to the one gap this client had.)
 
 `limit` caps how many messages a single catch-up may replay. It defaults to 100, and a value below 1 falls back to that default:
 
@@ -254,7 +289,10 @@ A catch-up reports `{complete: false, count: 0}` when:
 - the missed run is longer than `limit`, or reaches further back than history goes;
 - the history request itself fails (see the capability note below);
 - nothing has been delivered on the channel yet, so there is no cursor to catch up from;
+- **a second continuity gap opened while the catch-up was still running.** A gap-mode catch-up queries `untilAttach`, which anchors it to the attach point in force when the request went out, so it is blind to anything published during a later outage. The walk's backlog is then a prefix of what was actually missed, and a prefix is reported as a miss rather than as a recovery;
 - more than 1000 live messages piled up behind the catch-up while it ran. The catch-up is abandoned rather than the traffic — the buffered live messages are still delivered — and the abandonment is also reported through `error()`.
+
+A manual `replayMissed()` that joins a running catch-up is not a second gap: it reports no new outage, so it joins the attempt and shares its result unchanged.
 
 ### How far back history goes
 
@@ -305,13 +343,15 @@ import { configureEcho } from "@laravel/echo-react";
 import { AblyConnector } from "@kirschbaum-development/laravel-echo-ably";
 
 configureEcho({
-    // @ts-expect-error The hooks type `broadcaster` as one of Echo's built-in
-    // driver names; a custom connector is not in that union yet.
     broadcaster: AblyConnector,
 });
 ```
 
-That suppression is the whole caveat: the hook packages type `broadcaster` against Echo's map of built-in drivers, which no third-party connector can be a member of until the upstream `laravel/echo` PRs land. `useEcho`, `useEchoPresence` and friends behave normally. If you would rather not carry a suppression, use a plain `Echo` instance.
+No type suppression is needed on the versions this package supports. Echo 2.3.0–2.3.2 typed `broadcaster` as a union its own built-in driver names could satisfy and a constructor could not, which is why earlier revisions of this README carried a `@ts-expect-error`; that is fixed from 2.3.7 on, and the suppression is now itself an error (`TS2578: Unused '@ts-expect-error' directive`) — which is why the peer range starts at 2.3.7.
+
+`useEcho`, `useEchoPresence` and friends behave normally. Payload types still resolve to `any` rather than to this driver's channel classes, because Echo routes constructor broadcasters through its `function` slot — tracked in [#2](https://github.com/kirschbaum-development/laravel-echo-ably/issues/2). Type the channel as the exported `AblyChannel` / `AblyPrivateChannel` / `AblyPresenceChannel` where you need the driver's own methods.
+
+Create the Echo instance **once per browser tab**, at module scope or in a provider — never inside a component body. Each connector opens its own Ably connection, and Ably bills and rate-limits per connection; `configureEcho()` and a single module-level `new Echo(...)` both do the right thing, a `new Echo(...)` inside a component does not.
 
 ## Behavior notes
 
@@ -360,6 +400,23 @@ Echo.private("chat").whisper("typing", payload);
 
 **`Echo.disconnect()` reaches channel `error()` callbacks.** Closing the connection detaches its channels with an 80017 (`Connection closed`) `ErrorInfo`. It is the expected outcome of a deliberate close, not a fault.
 
+**`Echo.disconnect()` closes an injected client too.** If you passed your own client through `ably.client`, `disconnect()` still calls `close()` on it. That is deliberate — Echo's contract is that `disconnect()` ends the connection, and a connector that quietly left a socket open would leak one per Echo instance. If you need the client to outlive the Echo instance, keep your own reference and call `connect()` on it again afterwards.
+
+**One Echo instance per browser tab.** Each connector builds and owns one Ably `Realtime` client, shared by every channel it hands out; channels are cached by resolved name, so `Echo.private('orders')` twice is one subscription. What is _not_ deduplicated is a second `new Echo(...)` — that is a second connection, billed and rate-limited separately. Construct Echo once at module scope (or through `configureEcho()`) and import it; never inside a React component body.
+
+**`subscribed()` fires again on a discontinuity.** Ably reports lost continuity on an already-attached channel as an `update`, which the driver treats as a fresh attach: `subscribed()` callbacks run, presence members are re-entered, and `here()` re-reads the member list. That is required — a presence member who is not re-entered after a continuity break is silently absent from then on. It does mean `subscribed()` is "attached, possibly again", not "attached for the first time". If you set `updateOnAttached` through `channelOptions`, expect it on every attach acknowledgement.
+
+**Multiple Ably SDK instances share one recovery slot.** `ably-js` stashes its connection-recovery data in `sessionStorage` under a fixed key, `ably-connection-recovery`. Two Ably clients on the same origin — this driver plus a separate `@ably/chat` or `@ably/spaces` client, say — will overwrite each other's entry. Give one of them its own key if that applies to you:
+
+```ts
+new Echo({
+    broadcaster: AblyConnector,
+    ably: { clientOptions: { recoveryKeyStorageName: "ably-echo" } },
+});
+```
+
+This only matters if you opt into reload recovery (`clientOptions.recover`); with the default `closeOnUnload: true` nothing is persisted in the first place.
+
 ## Error handling
 
 Error callbacks receive Ably [`ErrorInfo`](https://ably.com/docs/api/realtime-sdk/types#error-info) objects — `{code, statusCode, message}` — not Pusher status codes:
@@ -372,16 +429,47 @@ Echo.private("orders").error((error) => {
 });
 ```
 
-| Code            | Meaning                                                                                                                           | What the driver does                                                                                                                                                                                                                                                                                                     |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `40102`         | Incompatible credentials — the connection's client id no longer matches the token's, which is what a login or a logout looks like | Drops the cached token, reconnects and re-subscribes every channel. Once per connection cycle, re-armed by the next successful connection. Implemented and unit-tested against a mocked client; verification against live Ably is tracked in [#5](https://github.com/kirschbaum-development/laravel-echo-ably/issues/5). |
-| `40140`–`40142` | Token not accepted, revoked or expired                                                                                            | `ably-js` re-invokes the driver's auth callback. A token with more than 30 seconds of life left is replayed as it is; one that is missing or inside that window is replaced by a fresh request to `authEndpoint` for the last channel capability was granted for.                                                        |
-| `40160`         | The token does not grant this channel                                                                                             | Private and presence channels force a token upgrade and re-attach, once per attach cycle: the retry is re-armed by every successful attach, so a channel that had been working gets a silent retry of its own. Two rejections in a row reach `error()`.                                                                  |
-| `40170`/`80019` | Your auth endpoint or `requestTokenFn` failed                                                                                     | Surfaces as a connection error. Expected once on the very first connection — see the note above.                                                                                                                                                                                                                         |
-| `80016`         | The connection was replaced by a newer one                                                                                        | Handled inside `ably-js`; no driver action.                                                                                                                                                                                                                                                                              |
-| `80017`         | Connection closed                                                                                                                 | Delivered to channel `error()` callbacks after `Echo.disconnect()`. Expected.                                                                                                                                                                                                                                            |
+| Code            | Meaning                                                                                                                           | What the driver does                                                                                                                                                                                                                                                                                                                                                  |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `40102`         | Incompatible credentials — the connection's client id no longer matches the token's, which is what a login or a logout looks like | Drops the cached token, reconnects and re-subscribes every channel. Once per connection cycle, re-armed by the next successful connection. Implemented and unit-tested against a mocked client; verification against live Ably is tracked in [#5](https://github.com/kirschbaum-development/laravel-echo-ably/issues/5).                                              |
+| `40140`–`40142` | Token not accepted, revoked or expired                                                                                            | `ably-js` re-invokes the driver's auth callback. A token with more than 30 seconds of life left is replayed as it is; one that is missing or inside that window is replaced by a fresh request to `authEndpoint` for the last channel capability was granted for.                                                                                                     |
+| `40160`         | The token does not grant this channel                                                                                             | Private and presence channels force a token upgrade and re-attach, once per attach cycle: the retry is re-armed by every successful attach, so a channel that had been working gets a silent retry of its own. Two rejections in a row reach `error()`.                                                                                                               |
+| `40170`/`80019` | Your auth endpoint or `requestTokenFn` failed                                                                                     | Surfaces as a connection error. Expected once on the very first connection — see the note above.                                                                                                                                                                                                                                                                      |
+| `80016`         | The connection was replaced by a newer one                                                                                        | Handled inside `ably-js`; no driver action.                                                                                                                                                                                                                                                                                                                           |
+| `80017`         | Connection closed                                                                                                                 | Delivered to channel `error()` callbacks after `Echo.disconnect()`. Expected.                                                                                                                                                                                                                                                                                         |
+| `90003`/`90005` | Continuity lost — messages expired, or the channel could not be resumed                                                           | Delivered to `error()` when Ably attaches it to the state change. **Do not gate recovery on these codes** — a gap often carries no reason at all. Use [`continuityLost()`](#knowing-when-continuity-is-lost), which fires on `resumed: false` whether or not an error came with it.                                                                                   |
+| `42913`         | Rate limit exceeded, e.g. on `[meta]connection.lifecycle`                                                                         | Passed through untouched. Reachable via `onConnectionStateChange()` — `onConnectionChange()` maps to Echo's four statuses and cannot carry a code. A limit on `[meta]connection.lifecycle` counts **connection** churn (connect/close cycles), not published messages: it points at reconnect storms or connections created per component, not at message throughput. |
 
 Failures during subscription — a rejected auth request, a refused attach — are routed to the channel's `error()` callbacks rather than thrown, and the most recent one is replayed to callbacks registered after it, so an `error()` handler added on the same tick as the channel still sees it.
+
+### Connection telemetry
+
+`Echo.connector.onConnectionChange()` answers Echo's own contract, which has four statuses — `connecting`, `connected`, `reconnecting`, `disconnected`, `failed` — where Ably has eight states and a `reason` on each. For diagnostics you usually want the unmapped feed:
+
+```ts
+import type { AblyConnector } from "@kirschbaum-development/laravel-echo-ably";
+
+// Echo types `connector` against its own built-in drivers, so in TypeScript
+// reach a third-party one through the exported class — the same cast the
+// channel classes need.
+const connector = Echo.connector as unknown as AblyConnector;
+
+const stop = connector.onConnectionStateChange((change) => {
+    Sentry.addBreadcrumb({
+        category: "ably",
+        message: `${change.previous} → ${change.current}`,
+        data: {
+            code: change.reason?.code, // e.g. 42913, 80019, 40102
+            statusCode: change.reason?.statusCode,
+            connectionId: connector.ably.connection.id,
+        },
+    });
+});
+
+stop(); // unsubscribes, like onConnectionChange
+```
+
+Nothing is rewritten or swallowed on the way through: these are Ably's own `ConnectionStateChange` objects, carrying its own `ErrorInfo`. The underlying client stays reachable as `Echo.connector.ably` for anything the driver does not model — `connection.id`, `connection.key`, transport details.
 
 ## Migrating
 
@@ -427,7 +515,7 @@ The built-in broadcaster is `pusher-js` against Ably's Pusher-protocol adapter. 
 ## Not supported yet
 
 - **Encrypted private channels.** `Echo.encryptedPrivate()` throws for any non-Pusher connector — Echo's core gates it with an `instanceof` check on its own connectors, so no third-party driver can implement it today.
-- **Typed hooks.** `configureEcho({broadcaster: AblyConnector})` needs a suppression until the upstream `laravel/echo` typing PRs land.
+- **Typed hook payloads.** `configureEcho({broadcaster: AblyConnector})` type-checks, but Echo routes constructor broadcasters through a slot typed `any`, so `useEcho` payloads do not resolve to this driver's channel classes until the upstream `laravel/echo` PRs land.
 - **Page-reload recovery.** Replay heals a live connection's gap; it does not carry a cursor across a page load. Ably's own connection `recover` key is available through `clientOptions` if you need it.
 - **Connections that only ever use public channels.** Supply a token through `clientOptions`, or a self-authenticating `client` — see the note above, and [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
 
@@ -441,6 +529,7 @@ npm test            # unit suite, ably-js mocked
 npm run lint
 npm run typecheck
 npm run build
+npm run verify:package   # packs, then compiles a real consumer against the tarball
 ```
 
 The integration suite talks to a real Ably app and is skipped unless a key is present:
@@ -450,6 +539,26 @@ ABLY_SANDBOX_KEY="name:secret" npm run test:integration
 ```
 
 Set `ABLY_SANDBOX_ENDPOINT` as well when the key belongs to a non-production app (`nonprod:sandbox` for one of Ably's ephemeral sandbox apps); without it the tests talk to production. CI runs the suite only when the repository secret is configured, so forks and pull requests without it are unaffected.
+
+### Releasing
+
+`dist/` is not committed — `prepack` rebuilds it, and `npm run verify:package` proves the tarball that comes out is installable. Both CI and the publish workflow run that check, so a release cannot ship a package whose entry points are missing.
+
+One-time setup:
+
+1. Create an **automation** access token on npmjs.com and add it as the `NPM_TOKEN` repository secret.
+2. After the first publish, consider switching to [npm trusted publishing](https://docs.npmjs.com/trusted-publishers): register this repository and `publish.yml` as a trusted publisher, then delete the secret and the `NODE_AUTH_TOKEN` line. `--provenance` already works either way, and needs the repository to be public.
+
+To cut a release:
+
+```shell
+npm version minor      # or patch / major — bumps package.json and tags
+git push --follow-tags
+```
+
+Pushing a `v*` tag runs lint, format, typecheck, tests, build and the packaging check, refuses to continue if the tag does not match `package.json` or the version is already on npm, publishes with provenance, and opens a GitHub release with generated notes. Run the workflow manually from the Actions tab first if you want a rehearsal — it defaults to a dry run.
+
+> `src/version.ts` carries the version reported to Ably as an agent string, and is not updated by `npm version`. Bump it in the same commit.
 
 ## License
 
