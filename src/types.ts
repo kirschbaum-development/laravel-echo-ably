@@ -55,6 +55,11 @@ export type RequestTokenFn = (
 export type AblyDriverOptions = {
     clientOptions?: Partial<ClientOptions>;
     client?: Realtime;
+    /**
+     * Build a replacement for an injected client after Ably reports 40102.
+     * The factory must return a new client each time it is called.
+     */
+    clientFactory?: () => Realtime;
     requestTokenFn?: RequestTokenFn;
     channelOptions?: Record<string, ChannelOptions>;
     /**

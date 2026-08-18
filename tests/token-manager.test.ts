@@ -190,6 +190,8 @@ describe("ensureCapability", () => {
         manager.setClient(client);
         await manager.ensureCapability("private:a");
 
+        await callAuthCallback(manager);
+
         const [tokenParams, authOptions] = authorize.mock.calls[0];
 
         expect(tokenParams).toBeUndefined();
@@ -272,6 +274,8 @@ describe("ensureCapability", () => {
         const manager = new TokenManager(ECHO_OPTIONS, {});
 
         await manager.ensureCapability("private:a");
+
+        await callAuthCallback(manager);
         await manager.ensureCapability("private:a", { force: true });
 
         expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -323,6 +327,7 @@ describe("ensureCapability", () => {
         const manager = new TokenManager(ECHO_OPTIONS, {});
 
         await manager.ensureCapability("private:a");
+
         await expect(manager.ensureCapability("private:b")).rejects.toThrow(
             "403",
         );
@@ -352,7 +357,7 @@ describe("ensureCapability", () => {
         expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
-    it("refreshes a token that is within 30 seconds of expiry", async () => {
+    it("lets ably decide when a token is close enough to expiry", async () => {
         const first = token({ "private:a": ["*"] }, 60);
         const second = token({ "private:a": ["*"] }, 3600);
         const fetchMock = stubFetch(
@@ -369,15 +374,15 @@ describe("ensureCapability", () => {
 
         expect(fetchMock).toHaveBeenCalledTimes(1);
 
-        // 29s of life left: inside the refresh window.
+        // 29s of life left: capability still covers the channel.
         vi.setSystemTime(NOW + 31_000);
         await manager.ensureCapability("private:a");
 
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-        expect(manager.currentToken()).toBe(second);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(manager.currentToken()).toBe(first);
     });
 
-    it("never treats a token without an exp claim as covering a channel", async () => {
+    it("uses capability even when a token has no exp claim", async () => {
         const noExpiry = makeJwt({
             iat: NOW_S,
             "x-ably-capability": JSON.stringify({ "private:a": ["*"] }),
@@ -391,7 +396,7 @@ describe("ensureCapability", () => {
         await manager.ensureCapability("private:a");
         await manager.ensureCapability("private:a");
 
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it("uses requestTokenFn in place of fetch when provided", async () => {
@@ -463,7 +468,7 @@ describe("authCallback", () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it("requests a fresh token when the cached one is inside the expiry window", async () => {
+    it("renews all tracked capabilities when ably asks for a token", async () => {
         // The renewal path an idle, listen-only connection depends on: nothing
         // else asks for capability, so without this the connection loses
         // realtime for good at the token's TTL.
@@ -477,8 +482,9 @@ describe("authCallback", () => {
 
         await manager.ensureCapability("private:a");
 
-        // 29s of life left: inside the window, so the cached token is not worth
-        // offering ably.
+        await callAuthCallback(manager);
+
+        // The cached token was already presented to ably, so this is a renewal.
         vi.setSystemTime(NOW + 31_000);
 
         const [error, details] = await callAuthCallback(manager);
@@ -486,17 +492,17 @@ describe("authCallback", () => {
         expect(error).toBeNull();
         expect(details?.token).toBe(second);
 
-        // Requested for the last channel a grant was actually made for, and
-        // carrying the old token so the server accretes onto its capability.
+        // The first renewal request is deliberately unchained. Later requests
+        // carry the replacement token so the server can accrete capability.
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(requestBody(fetchMock.mock.calls[1])).toEqual({
             channel_name: "private:a",
-            token: first,
+            token: null,
         });
         expect(manager.currentToken()).toBe(second);
     });
 
-    it("renews for the last channel that was granted, not the last one asked for", async () => {
+    it("renews every tracked channel", async () => {
         const first = token({ "private:a": ["*"] }, 60);
         const second = token({ "private:a": ["*"], "private:b": ["*"] }, 60);
         const third = token({ "private:a": ["*"], "private:b": ["*"] }, 3600);
@@ -513,12 +519,17 @@ describe("authCallback", () => {
         // become what a renewal asks for.
         await manager.ensureCapability("private:a");
 
+        await callAuthCallback(manager);
+
         vi.setSystemTime(NOW + 31_000);
 
         await callAuthCallback(manager);
 
-        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(fetchMock).toHaveBeenCalledTimes(4);
         expect(requestBody(fetchMock.mock.calls[2]).channel_name).toBe(
+            "private:a",
+        );
+        expect(requestBody(fetchMock.mock.calls[3]).channel_name).toBe(
             "private:b",
         );
     });
@@ -566,6 +577,8 @@ describe("authCallback", () => {
         const manager = new TokenManager(ECHO_OPTIONS, {});
 
         await manager.ensureCapability("private:a");
+
+        await callAuthCallback(manager);
 
         vi.setSystemTime(NOW + 31_000);
 

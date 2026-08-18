@@ -1041,6 +1041,94 @@ describe("AblyConnector", () => {
         });
     });
 
+    describe("reconnecting", () => {
+        it("reopens the existing client rather than building a second one", () => {
+            const { realtime, connector } = setup();
+
+            connector.disconnect();
+            connector.connect();
+
+            expect(connector.ably).toBe(realtime);
+            expect(realtime.connect).toHaveBeenCalledTimes(1);
+        });
+
+        it("builds no second client when the driver owns it", () => {
+            const connector = new AblyConnector(
+                echoOptions({
+                    requestTokenFn: vi.fn().mockResolvedValue({ token: TOKEN }),
+                }),
+            );
+
+            realtimeConstructor.mockClear();
+
+            connector.disconnect();
+            connector.connect();
+
+            // A second client would strand every channel already handed out on
+            // the closed one, with nothing reporting that they had gone quiet.
+            expect(realtimeConstructor).not.toHaveBeenCalled();
+        });
+
+        it("keeps existing channels on the client the connector is using", async () => {
+            const { connector } = setup();
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            connector.disconnect();
+            connector.connect();
+            await flush();
+
+            expect(channel.ably).toBe(connector.ably);
+        });
+
+        it("re-attaches the channels that were live before the disconnect", async () => {
+            const { realtime, connector } = setup();
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            const underlying = realtime.channels.all["private:orders"];
+
+            underlying.attach.mockClear();
+
+            connector.disconnect();
+            connector.connect();
+            await settle(channel);
+            await flush();
+
+            expect(underlying.attach).toHaveBeenCalled();
+        });
+
+        it("registers its connection listeners once, however often connect runs", () => {
+            const { realtime, connector } = setup();
+
+            const registered = realtime.connection.on.mock.calls.length;
+
+            connector.connect();
+            connector.connect();
+
+            expect(realtime.connection.on.mock.calls.length).toBe(registered);
+        });
+
+        it("keeps the token it already holds, so a reconnect re-authorizes nothing", async () => {
+            const requestTokenFn = vi.fn().mockResolvedValue({ token: TOKEN });
+            const { connector } = setup({ requestTokenFn });
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+            expect(requestTokenFn).toHaveBeenCalledTimes(1);
+
+            connector.disconnect();
+            connector.connect();
+            await settle(channel);
+            await flush();
+
+            expect(connector.tokenManager.currentToken()).toBe(TOKEN);
+            expect(requestTokenFn).toHaveBeenCalledTimes(1);
+        });
+    });
+
     describe("through Echo", () => {
         it("drives a private channel end to end", async () => {
             const realtime = createMockRealtime();

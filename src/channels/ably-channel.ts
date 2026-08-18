@@ -92,6 +92,19 @@ export class AblyChannel extends Channel {
 
     protected tokenManager: TokenManager;
 
+    /** Changes when this channel moves to a different Realtime client. */
+    private bindingGeneration = 0;
+
+    /** Whether `subscription` belongs to the current client. */
+    private hasSubscription = false;
+
+    /**
+     * While true, the listener maps are the source for the new client's
+     * registrations. New listener calls update the maps but do not also queue
+     * a duplicate registration.
+     */
+    protected restoringSubscriptions = false;
+
     /**
      * Whether this channel replays missed events, and how many at most. Fixed
      * for the life of the channel: the engine's gate, its bookkeeping and the
@@ -206,15 +219,22 @@ export class AblyChannel extends Channel {
      * escaping rejection would be unhandled — nothing awaits `ready` but us.
      */
     async subscribe(): Promise<void> {
+        const generation = this.bindingGeneration;
+
         this.failureReportedByState = false;
 
         try {
             await this.tokenManager.ensureCapability(this.name);
 
+            if (generation !== this.bindingGeneration) {
+                return;
+            }
+
             this.subscription = this.ably.channels.get(
                 this.name,
                 this.channelOptions(),
             );
+            this.hasSubscription = true;
 
             // A channel handed over already attached has attached before this
             // instance existed — a leave→rejoin, where the predecessor left it
@@ -235,10 +255,20 @@ export class AblyChannel extends Channel {
                 this.subscription.on(this.stateListener);
             }
 
+            if (this.restoringSubscriptions) {
+                this.restoreMessageSubscriptions(this.subscription);
+                this.restoreAdditionalSubscriptions(this.subscription);
+                this.restoringSubscriptions = false;
+            }
+
             this.registerCatchAll();
 
             await this.subscription.attach();
         } catch (error) {
+            if (generation !== this.bindingGeneration) {
+                return;
+            }
+
             // Ownership: anything the channel reported as a state change
             // belongs to the state listener, which is where the
             // `onChannelFailed` hook gets its say. Only failures that never
@@ -250,6 +280,53 @@ export class AblyChannel extends Channel {
 
             this.dispatchError(error);
         }
+    }
+
+    /**
+     * Move this channel object and all of its listeners to a new Ably client.
+     * The object identity stays stable for code that already holds it.
+     */
+    replaceClient(ably: Realtime, tokenManager: TokenManager): void {
+        const previous = this.hasSubscription ? this.subscription : null;
+
+        this.bindingGeneration += 1;
+
+        if (previous) {
+            if (this.catchAllListener) {
+                previous.unsubscribe(this.catchAllListener);
+                this.catchAllListener = null;
+            }
+
+            for (const [event, wrappers] of this.listeners) {
+                for (const wrapper of wrappers.values()) {
+                    previous.unsubscribe(event, wrapper);
+                }
+            }
+
+            for (const wrapper of this.globalListeners.values()) {
+                previous.unsubscribe(wrapper);
+            }
+
+            if (this.stateListener) {
+                previous.off(this.stateListener);
+                this.stateListener = null;
+            }
+
+            this.removeAdditionalSubscriptions(previous);
+        }
+
+        this.releaseInstance();
+
+        this.ably = ably;
+        this.tokenManager = tokenManager;
+        this.hasSubscription = false;
+        this.hasAttachedBefore = false;
+        this.failureReportedByState = false;
+        this.restoringSubscriptions = true;
+        this.engine?.reset();
+
+        this.claimInstance();
+        this.ready = this.subscribe();
     }
 
     /**
@@ -567,8 +644,23 @@ export class AblyChannel extends Channel {
                 ? []
                 : [...(this.listeners.get(message.name)?.values() ?? [])];
 
-        global.forEach((wrapper) => wrapper(message));
-        wrappers.forEach((wrapper) => wrapper(message));
+        for (const wrapper of [...global, ...wrappers]) {
+            try {
+                wrapper(message);
+            } catch (error) {
+                this.dispatchError(error);
+            }
+        }
+    }
+
+    /** Restore subclass-owned registrations on a replacement client. */
+    protected restoreAdditionalSubscriptions(_channel: RealtimeChannel): void {
+        return undefined;
+    }
+
+    /** Remove subclass-owned registrations from the previous client. */
+    protected removeAdditionalSubscriptions(_channel: RealtimeChannel): void {
+        return undefined;
     }
 
     /**
@@ -767,11 +859,28 @@ export class AblyChannel extends Channel {
     private updateSubscription(
         operation: (channel: RealtimeChannel) => unknown,
     ): void {
-        if (this.replayConfig.enabled) {
+        if (this.replayConfig.enabled || this.restoringSubscriptions) {
             return;
         }
 
         this.whenReady(operation);
+    }
+
+    /** Register every message listener kept in the local maps. */
+    private restoreMessageSubscriptions(channel: RealtimeChannel): void {
+        if (this.replayConfig.enabled) {
+            return;
+        }
+
+        for (const [event, wrappers] of this.listeners) {
+            for (const wrapper of wrappers.values()) {
+                void channel.subscribe(event, wrapper).catch(() => undefined);
+            }
+        }
+
+        for (const wrapper of this.globalListeners.values()) {
+            void channel.subscribe(wrapper).catch(() => undefined);
+        }
     }
 
     /** Record this instance as a user of the channel this name resolves to. */
@@ -811,10 +920,19 @@ export class AblyChannel extends Channel {
     protected whenReady(
         operation: (channel: RealtimeChannel) => unknown,
     ): void {
+        const generation = this.bindingGeneration;
+
         this.ready
-            .then(() =>
-                this.subscription ? operation(this.subscription) : undefined,
-            )
+            .then(() => {
+                if (
+                    generation !== this.bindingGeneration ||
+                    !this.hasSubscription
+                ) {
+                    return undefined;
+                }
+
+                return operation(this.subscription);
+            })
             .catch(() => undefined);
     }
 
@@ -824,7 +942,14 @@ export class AblyChannel extends Channel {
     protected dispatchError(error: unknown): void {
         this.lastError = error;
 
-        this.errorCallbacks.forEach((callback) => callback(error));
+        for (const callback of [...this.errorCallbacks]) {
+            try {
+                callback(error);
+            } catch {
+                // Error callbacks are the final reporting boundary. One broken
+                // reporter must not stop the other reporters.
+            }
+        }
     }
 
     /**

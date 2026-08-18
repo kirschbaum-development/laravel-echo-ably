@@ -119,6 +119,21 @@ export class AblyConnector extends Connector<
      * Create a fresh Ably connection.
      */
     connect(): void {
+        // Re-entry: `Echo.connect()` after a `disconnect()`, most commonly a
+        // logout/login cycle or a tab putting realtime to sleep. Everything is
+        // already built, so the connection only has to come back and the
+        // channels the app still holds have to be re-attached onto it.
+        //
+        // Rebuilding here instead would hand the connector a second client and
+        // leave every channel already handed out bound to the closed one —
+        // `channels` still caches them, so `Echo.private('orders')` would return
+        // a dead subscription and nothing would report that it had gone quiet.
+        if (this.ably) {
+            this.reopen();
+
+            return;
+        }
+
         const driverOptions: AblyDriverOptions = this.options.ably ?? {};
 
         // Built from the merged options, not the ones handed to the
@@ -128,15 +143,40 @@ export class AblyConnector extends Connector<
         this.replayConfig = normalizeReplay(driverOptions.replay);
         this.ably = driverOptions.client ?? this.createClient(driverOptions);
         this.tokenManager.setClient(this.ably);
+        this.bindConnection(this.ably);
+    }
 
-        this.ably.connection.on("connected", () => {
+    private bindConnection(client: Realtime): void {
+        client.connection.on("connected", () => {
             // A working connection closes the recovery cycle: whatever comes
             // after it is a new problem, not the old one still failing.
             this.recoverySpent = false;
         });
 
-        this.ably.connection.on("failed", (change: ConnectionStateChange) => {
+        client.connection.on("failed", (change: ConnectionStateChange) => {
             this.recoverFromClientIdMismatch(change);
+        });
+    }
+
+    /**
+     * Bring a closed connection back, with the channels that were on it.
+     *
+     * The client, the token manager and the connection listeners all survive a
+     * `disconnect()`, so none of them is rebuilt: a cached token that still
+     * covers its channels carries straight over, and re-registering the
+     * listeners would double every 40102 recovery.
+     */
+    private reopen(): void {
+        // A new connection cycle gets a new recovery budget.
+        this.recoverySpent = false;
+
+        this.ably.connect();
+
+        Object.values(this.channels).forEach((channel) => {
+            // `subscribe()` reports its own failures through the channel's
+            // `error()` callbacks and never rejects, so there is nothing here
+            // to await or catch.
+            void channel.subscribe();
         });
     }
 
@@ -370,7 +410,23 @@ export class AblyConnector extends Connector<
         this.recoverySpent = true;
 
         this.tokenManager.reset();
-        this.ably.connect();
+        const driverOptions: AblyDriverOptions = this.options.ably ?? {};
+        if (driverOptions.client && !driverOptions.clientFactory) {
+            this.ably.connect();
+            Object.values(this.channels).forEach(
+                (channel) => void channel.subscribe(),
+            );
+            return;
+        }
+        const previous = this.ably;
+        const replacement = driverOptions.clientFactory
+            ? driverOptions.clientFactory()
+            : this.createClient(driverOptions);
+
+        this.tokenManager.trackChannels(Object.keys(this.channels));
+        this.ably = replacement;
+        this.tokenManager.setClient(replacement);
+        this.bindConnection(replacement);
 
         Object.values(this.channels).forEach((channel) => {
             // `subscribe()` reports its own failures through the channel's
@@ -381,8 +437,14 @@ export class AblyConnector extends Connector<
             // failure being reported twice is per subscribe attempt, so an
             // unrelated state change arriving while this re-subscribe waits on
             // its token can mask a state-less attach rejection.
-            void channel.subscribe();
+            channel.replaceClient(replacement, this.tokenManager);
         });
+
+        // Close the old connection cycle. A supplied factory is the safe path
+        // for a client whose clientId changed; the call also preserves normal
+        // lifecycle notifications for injected clients.
+        previous.connect();
+        replacement.connect();
     }
 }
 

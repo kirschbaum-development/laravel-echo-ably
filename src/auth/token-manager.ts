@@ -4,12 +4,6 @@ import { isGuarded } from "../util/channel-name";
 import type { ParsedJwt } from "./jwt";
 import { parseJwt, toTokenDetails } from "./jwt";
 
-/**
- * A token this close to expiry is treated as already expired: attaching with it
- * would race the server's own expiry check.
- */
-const EXPIRY_WINDOW_MS = 30_000;
-
 /** What ably is told when there is no token and no way to ask for one. */
 const NO_TOKEN =
     "No Ably token available yet: subscribe to a channel before authenticating.";
@@ -34,17 +28,14 @@ export class TokenManager {
     private client: Realtime | null = null;
     private queue: Promise<unknown> = Promise.resolve();
     private info = new Map<string, unknown>();
+    /** Guarded channels this manager must keep in its next token. */
+    private readonly guardedChannels = new Set<string>();
+    /** The token already handed to this client, directly or by authCallback. */
+    private presentedToken: string | null = null;
+    /** Concurrent auth callbacks share one fresh-token request. */
+    private renewal: Promise<string | null> | null = null;
     /** Bumped by `reset()`; requests started under an older value are stale. */
     private generation = 0;
-
-    /**
-     * The last guarded channel a token was actually granted for, and so the
-     * channel a renewal asks about: the server accretes each grant onto the
-     * token it is handed, so asking for the most recent one comes back with
-     * everything the expiring token carried. Survives `reset()` — it describes
-     * what this app subscribes to, not which session held the token.
-     */
-    private lastGrantedChannel: string | null = null;
 
     constructor(
         echoOptions: TokenManagerEchoOptions,
@@ -57,6 +48,18 @@ export class TokenManager {
     /** The live connection to re-authorize whenever a new token arrives. */
     setClient(client: Realtime): void {
         this.client = client;
+    }
+
+    /**
+     * Record channels before a replacement client starts authentication.
+     * This gives its first auth callback enough information to mint a token.
+     */
+    trackChannels(channelNames: Iterable<string>): void {
+        for (const channelName of channelNames) {
+            if (isGuarded(channelName)) {
+                this.guardedChannels.add(channelName);
+            }
+        }
     }
 
     currentToken(): string | null {
@@ -72,6 +75,8 @@ export class TokenManager {
     reset(): void {
         this.token = null;
         this.parsed = null;
+        this.presentedToken = null;
+        this.renewal = null;
         // The presence payloads belong to the identity that just went away:
         // keeping them would enter the next member under the old one's data.
         this.info.clear();
@@ -90,6 +95,8 @@ export class TokenManager {
         if (!isGuarded(channelName)) {
             return Promise.resolve();
         }
+
+        this.guardedChannels.add(channelName);
 
         return this.grant(channelName, { force: opts.force, push: true });
     }
@@ -118,7 +125,7 @@ export class TokenManager {
             // request still waiting its turn should start fresh under the
             // current session rather than be discarded with it.
             const generation = this.generation;
-            const response = await this.requestToken(channelName);
+            const response = await this.requestToken(channelName, this.token);
             // Parse before storing: a malformed token must leave the previous
             // one in place rather than half-replace it.
             const parsed = parseJwt(response.token);
@@ -132,8 +139,6 @@ export class TokenManager {
 
             this.token = response.token;
             this.parsed = parsed;
-            this.lastGrantedChannel = channelName;
-
             if (response.info !== undefined) {
                 this.info.set(channelName, response.info);
             }
@@ -148,6 +153,8 @@ export class TokenManager {
                     // its next token (40171) — taking renewal with it.
                     authCallback: this.authCallback,
                 });
+
+                this.presentedToken = response.token;
             }
         });
 
@@ -177,7 +184,10 @@ export class TokenManager {
             tokenDetails: TokenDetails | null,
         ) => void,
     ): void => {
-        if (this.token && !this.expiresSoon()) {
+        // A token fetched before a client existed has not been used yet. Offer
+        // it once. Later callbacks are Ably's request for a replacement.
+        if (this.token && this.token !== this.presentedToken) {
+            this.presentedToken = this.token;
             callback(null, toTokenDetails(this.token));
 
             return;
@@ -186,13 +196,13 @@ export class TokenManager {
         // Nothing guarded was ever subscribed to, so there is no channel to ask
         // `/broadcasting/auth` about. A connection that only ever uses public
         // channels needs a credential of its own (tracking issue #4).
-        if (!this.lastGrantedChannel) {
+        if (this.guardedChannels.size === 0) {
             callback(NO_TOKEN, null);
 
             return;
         }
 
-        void this.renew(this.lastGrantedChannel, callback);
+        void this.renew(callback);
     };
 
     /**
@@ -201,52 +211,98 @@ export class TokenManager {
      * does not push it onto the connection a second time.
      */
     private async renew(
-        channelName: string,
         callback: (
             error: ErrorInfo | string | null,
             tokenDetails: TokenDetails | null,
         ) => void,
     ): Promise<void> {
         try {
-            await this.grant(channelName, { push: false });
+            const token = await this.renewToken();
+
+            if (!token) {
+                callback(NO_TOKEN, null);
+
+                return;
+            }
+
+            this.presentedToken = token;
+            callback(null, toTokenDetails(token));
         } catch (error) {
             // ably's callback signature takes `ErrorInfo | string`, and an
             // `Error` is in neither, so the reason travels as its message.
-            callback(
-                error instanceof Error ? error.message : String(error),
-                null,
-            );
-
-            return;
+            const message =
+                error instanceof Error
+                    ? error.message
+                    : typeof error === "object" &&
+                        error !== null &&
+                        "message" in error
+                      ? String((error as { message: unknown }).message)
+                      : String(error);
+            callback(message, null);
         }
-
-        // A reset() landing mid-renewal discards the reply, and a token that
-        // never arrived is not one to authenticate with.
-        if (!this.token) {
-            callback(NO_TOKEN, null);
-
-            return;
-        }
-
-        callback(null, toTokenDetails(this.token));
     }
 
-    /** Is the cached token gone, or too close to expiry to be worth offering? */
-    private expiresSoon(): boolean {
-        // A token with no `exp` claim parses to `expires: 0`, so it lands here
-        // and is never trusted.
-        return (
-            !this.parsed || this.parsed.expires - Date.now() < EXPIRY_WINDOW_MS
-        );
+    /**
+     * Mint a token with a new lifetime, then rebuild all tracked capability on
+     * it. The first request carries no token. This is important because the
+     * Laravel broadcaster keeps the old JWT's `iat` and `exp` while that JWT is
+     * still valid.
+     */
+    private renewToken(): Promise<string | null> {
+        if (this.renewal) {
+            return this.renewal;
+        }
+
+        const run = this.queue.then(async () => {
+            const generation = this.generation;
+            let nextToken: string | null = null;
+            let nextParsed: ParsedJwt | null = null;
+            const nextInfo = new Map<string, unknown>();
+
+            for (const channelName of this.guardedChannels) {
+                const response = await this.requestToken(
+                    channelName,
+                    nextToken,
+                );
+
+                nextParsed = parseJwt(response.token);
+                nextToken = response.token;
+
+                if (response.info !== undefined) {
+                    nextInfo.set(channelName, response.info);
+                }
+            }
+
+            if (generation !== this.generation || !nextToken || !nextParsed) {
+                return null;
+            }
+
+            this.token = nextToken;
+            this.parsed = nextParsed;
+
+            for (const [channelName, info] of nextInfo) {
+                this.info.set(channelName, info);
+            }
+
+            return nextToken;
+        });
+
+        this.queue = run.catch(() => undefined);
+
+        const renewal = run.finally(() => {
+            if (this.renewal === renewal) {
+                this.renewal = null;
+            }
+        });
+
+        this.renewal = renewal;
+
+        return renewal;
     }
 
-    /** Does the cached token grant `channelName` for long enough to use? */
+    /** Does the cached token grant `channelName`? Ably owns expiry timing. */
     private covers(channelName: string): boolean {
         if (!this.token || !this.parsed) {
-            return false;
-        }
-
-        if (this.expiresSoon()) {
             return false;
         }
 
@@ -261,11 +317,14 @@ export class TokenManager {
         return Boolean(capability[`${namespace}:*`]);
     }
 
-    private async requestToken(channelName: string): Promise<TokenResponse> {
+    private async requestToken(
+        channelName: string,
+        existingToken: string | null,
+    ): Promise<TokenResponse> {
         const { requestTokenFn } = this.driverOptions;
 
         if (requestTokenFn) {
-            return requestTokenFn(channelName, this.token);
+            return requestTokenFn(channelName, existingToken);
         }
 
         const response = await fetch(this.echoOptions.authEndpoint, {
@@ -276,7 +335,7 @@ export class TokenManager {
             },
             body: JSON.stringify({
                 channel_name: channelName,
-                token: this.token,
+                token: existingToken,
             }),
         });
 

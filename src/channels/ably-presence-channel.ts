@@ -121,6 +121,22 @@ export class AblyPresenceChannel
         super.unsubscribe();
     }
 
+    /** Restore this instance's presence listeners on a replacement client. */
+    protected restoreAdditionalSubscriptions(channel: RealtimeChannel): void {
+        for (const { actions, listener } of this.presenceListeners) {
+            void channel.presence
+                .subscribe(actions, listener)
+                .catch((error: unknown) => this.dispatchError(error));
+        }
+    }
+
+    /** Remove this instance's presence listeners from the previous client. */
+    protected removeAdditionalSubscriptions(channel: RealtimeChannel): void {
+        for (const { actions, listener } of this.presenceListeners) {
+            channel.presence.unsubscribe(actions, listener);
+        }
+    }
+
     /**
      * Announce this member to the presence set. Resolves either way — the
      * caller reads the member list next, whether or not this member made it in.
@@ -178,11 +194,13 @@ export class AblyPresenceChannel
             listener,
         });
 
-        this.whenReady((channel) =>
-            channel.presence
-                .subscribe(action, listener)
-                .catch((error: unknown) => this.dispatchError(error)),
-        );
+        if (!this.restoringSubscriptions) {
+            this.whenReady((channel) =>
+                channel.presence
+                    .subscribe(action, listener)
+                    .catch((error: unknown) => this.dispatchError(error)),
+            );
+        }
 
         return this;
     }

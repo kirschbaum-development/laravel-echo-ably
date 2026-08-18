@@ -30,7 +30,7 @@ function decodeSegment(segment: string): Record<string, unknown> {
 /**
  * Parse (without verifying) the HS256 JWT returned by Laravel's
  * `ably/laravel-broadcaster`. Signature verification is a server concern; the
- * client only needs the claims to know when to refresh.
+ * client only needs the claims to describe the token and inspect capability.
  */
 export function parseJwt(jwt: string): ParsedJwt {
     const segments = jwt.split(".");
