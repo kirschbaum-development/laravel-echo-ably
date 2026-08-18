@@ -505,6 +505,33 @@ describe("AblyConnector", () => {
         });
     });
 
+    describe("forgetting a channel that was left", () => {
+        it("stops a renewal asking for it", async () => {
+            const requestTokenFn = vi.fn().mockResolvedValue({ token: TOKEN });
+            const { connector } = setup({ requestTokenFn });
+
+            await settle(connector.privateChannel("orders"));
+            await settle(connector.privateChannel("chat"));
+
+            connector.leaveChannel("private-orders");
+
+            requestTokenFn.mockClear();
+
+            await new Promise<void>((resolve) =>
+                connector.tokenManager.authCallback({}, () => resolve()),
+            );
+
+            // A renewal rebuilds capability channel by channel. Asking about a
+            // channel the app has left is at best a wasted request, and at
+            // worst a rejection that takes the whole renewal — and with it the
+            // connection's next credential — down.
+            const asked = requestTokenFn.mock.calls.map((call) => call[0]);
+
+            expect(asked).not.toContain("private:orders");
+            expect(asked).toContain("private:chat");
+        });
+    });
+
     describe("leaving and rejoining the same name", () => {
         it("leaves the successor channel working when the predecessor tears down", async () => {
             // React StrictMode's mount → cleanup → mount, and any quick

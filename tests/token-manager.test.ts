@@ -132,16 +132,51 @@ afterEach(() => {
 });
 
 describe("ensureCapability", () => {
-    it("resolves public channels without an auth request", async () => {
-        const fetchMock = stubFetch();
+    it("requests a token for a public channel when there is none yet", async () => {
+        // Ably authenticates the connection, not the channel: an app that only
+        // ever subscribes to public channels still needs a credential, and
+        // without this it never asks for one and never connects.
+        const granted = token({ "public:*": ["subscribe", "history"] });
+        const fetchMock = stubFetch(jsonResponse({ token: granted }));
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("public:orders");
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(requestBody(fetchMock.mock.calls[0]).channel_name).toBe(
+            "public:orders",
+        );
+        expect(manager.currentToken()).toBe(granted);
+    });
+
+    it("resolves a public channel even when the token request fails", async () => {
+        // Public channels carry no capability of their own, so a subscribe must
+        // not be blocked by an auth endpoint that is down: the channel attaches
+        // and the credential problem surfaces on the connection instead.
+        const fetchMock = stubFetch(jsonResponse({ message: "nope" }, 500));
         const manager = new TokenManager(ECHO_OPTIONS, {});
 
         await expect(
             manager.ensureCapability("public:orders"),
         ).resolves.toBeUndefined();
 
-        expect(fetchMock).not.toHaveBeenCalled();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(manager.currentToken()).toBeNull();
+    });
+
+    it("asks nothing more of a public channel once a token exists", async () => {
+        // Every token the broadcaster signs already grants `public:*`, so a
+        // public subscribe never needs an upgrade — only a credential to exist.
+        const fetchMock = stubFetch(
+            jsonResponse({ token: token({ "private:orders": ["*"] }) }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("private:orders");
+        await manager.ensureCapability("public:orders");
+        await manager.ensureCapability("public:other");
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it("requests a token for the first guarded channel and applies it to the client", async () => {
@@ -549,23 +584,25 @@ describe("authCallback", () => {
         expect(details).toBeNull();
     });
 
-    it("still errors when no guarded channel was ever requested", async () => {
-        // A public-only connection has no channel to renew for: there is
-        // nothing `/broadcasting/auth` could be asked to grant. Tracked as
-        // issue #4 rather than guessed at here.
-        const fetchMock = stubFetch();
+    it("renews for a public channel when nothing guarded is in use", async () => {
+        // A public-only connection authenticates like any other: ably grants
+        // credentials per connection, so the public channel it does subscribe
+        // to is what a renewal asks `/broadcasting/auth` about.
+        const renewed = token({ "public:*": ["subscribe", "history"] }, 7200);
+        const fetchMock = stubFetch(
+            jsonResponse({ token: token({ "public:*": ["subscribe"] }) }),
+            jsonResponse({ token: renewed }),
+        );
         const manager = new TokenManager(ECHO_OPTIONS, {});
 
         await manager.ensureCapability("public:orders");
+        await callAuthCallback(manager);
 
-        const callback = vi.fn<AuthCallbackFn>();
-        manager.authCallback({}, callback);
+        const [error, details] = await callAuthCallback(manager);
 
-        const [error, details] = callback.mock.calls[0];
-
-        expect(typeof error).toBe("string");
-        expect(details).toBeNull();
-        expect(fetchMock).not.toHaveBeenCalled();
+        expect(error).toBeNull();
+        expect(details?.token).toBe(renewed);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
     it("reports a failed renewal to ably rather than an empty token", async () => {
@@ -714,5 +751,72 @@ describe("reset", () => {
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(requestBody(fetchMock.mock.calls[1]).token).toBeNull();
         expect(manager.currentToken()).toBe(fresh);
+    });
+});
+
+describe("public-only connections", () => {
+    it("authenticates from a public channel alone", async () => {
+        const granted = token({ "public:*": ["subscribe", "history"] });
+        const fetchMock = stubFetch(
+            jsonResponse({ token: granted }),
+            jsonResponse({ token: granted }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        await manager.ensureCapability("public:orders");
+
+        // The token was fetched before ably asked, so the first callback is
+        // offered it as-is; the next is ably asking for a replacement.
+        await callAuthCallback(manager);
+
+        const [error, details] = await callAuthCallback(manager);
+
+        expect(error).toBeNull();
+        expect(details?.token).toBe(granted);
+        expect(requestBody(fetchMock.mock.calls[1]).channel_name).toBe(
+            "public:orders",
+        );
+    });
+
+    it("still reports no token when nothing has been subscribed at all", async () => {
+        stubFetch();
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        const [error, details] = await callAuthCallback(manager);
+
+        expect(String(error)).toContain("No Ably token available");
+        expect(details).toBeNull();
+    });
+});
+
+describe("untrackChannel", () => {
+    it("stops a renewal asking for a channel that was left", async () => {
+        const fetchMock = stubFetch(
+            jsonResponse({ token: token({ "private:orders": ["*"] }) }),
+            jsonResponse({ token: token({ "private:chat": ["*"] }) }),
+            jsonResponse({ token: token({ "private:chat": ["*"] }) }),
+        );
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+        const { client } = fakeClient();
+
+        manager.setClient(client);
+        await manager.ensureCapability("private:orders");
+        await manager.ensureCapability("private:chat");
+
+        manager.untrackChannel("private:orders");
+
+        fetchMock.mockClear();
+        await callAuthCallback(manager);
+        await callAuthCallback(manager);
+
+        // A renewal rebuilds capability channel by channel. One the app has
+        // left is a request that can only fail — the user may no longer be
+        // authorized for it — and would take the whole renewal down with it.
+        const asked = fetchMock.mock.calls.map(
+            (call) => requestBody(call).channel_name,
+        );
+
+        expect(asked).not.toContain("private:orders");
+        expect(asked).toContain("private:chat");
     });
 });

@@ -30,6 +30,15 @@ export class TokenManager {
     private info = new Map<string, unknown>();
     /** Guarded channels this manager must keep in its next token. */
     private readonly guardedChannels = new Set<string>();
+    /**
+     * Public channels in use.
+     *
+     * They need no capability of their own — every token the broadcaster signs
+     * grants `public:*` — but ably authenticates the *connection*, not the
+     * channel, so a client that only ever subscribes to these still has to ask
+     * for a token. One of these names is what it asks about.
+     */
+    private readonly publicChannels = new Set<string>();
     /** The token already handed to this client, directly or by authCallback. */
     private presentedToken: string | null = null;
     /** Concurrent auth callbacks share one fresh-token request. */
@@ -58,8 +67,27 @@ export class TokenManager {
         for (const channelName of channelNames) {
             if (isGuarded(channelName)) {
                 this.guardedChannels.add(channelName);
+            } else {
+                this.publicChannels.add(channelName);
             }
         }
+    }
+
+    /**
+     * Forget a channel the app has left.
+     *
+     * A renewal rebuilds capability channel by channel, so a name left in here
+     * is a request that outlives its subscription: at best wasted, at worst a
+     * rejection — the user may no longer be authorized for it — that takes the
+     * whole renewal down and leaves the connection without a credential.
+     *
+     * The presence `info` is deliberately kept: a rejoin whose capability the
+     * cached token still covers makes no new request, and would otherwise
+     * re-enter the member with no data at all.
+     */
+    untrackChannel(channelName: string): void {
+        this.guardedChannels.delete(channelName);
+        this.publicChannels.delete(channelName);
     }
 
     currentToken(): string | null {
@@ -93,7 +121,24 @@ export class TokenManager {
         opts: { force?: boolean } = {},
     ): Promise<void> {
         if (!isGuarded(channelName)) {
-            return Promise.resolve();
+            this.publicChannels.add(channelName);
+
+            // Only when there is no credential at all. A token already in hand
+            // covers every public channel, so a public subscribe never needs an
+            // upgrade — it only needs a token to exist, which on a public-only
+            // connection nothing else would ever ask for.
+            if (this.token) {
+                return Promise.resolve();
+            }
+
+            // Best effort: a public channel needs no capability of its own, so
+            // a request that fails must not stop it attaching. The connection
+            // may already be authenticated by a guarded channel, or come up
+            // when one arrives; a failure that matters surfaces as a connection
+            // error rather than as a channel that never subscribed.
+            return this.grant(channelName, { push: true }).catch(
+                () => undefined,
+            );
         }
 
         this.guardedChannels.add(channelName);
@@ -193,10 +238,10 @@ export class TokenManager {
             return;
         }
 
-        // Nothing guarded was ever subscribed to, so there is no channel to ask
-        // `/broadcasting/auth` about. A connection that only ever uses public
-        // channels needs a credential of its own (tracking issue #4).
-        if (this.guardedChannels.size === 0) {
+        // Nothing has been subscribed to at all, so there is no channel to ask
+        // `/broadcasting/auth` about yet. ably retries the callback, and the
+        // first subscribe pushes a token onto the connection.
+        if (this.guardedChannels.size === 0 && this.publicChannels.size === 0) {
             callback(NO_TOKEN, null);
 
             return;
@@ -259,7 +304,15 @@ export class TokenManager {
             let nextParsed: ParsedJwt | null = null;
             const nextInfo = new Map<string, unknown>();
 
-            for (const channelName of this.guardedChannels) {
+            // Guarded channels carry the capability a renewal has to rebuild.
+            // With none in use there is nothing to accrete, and one public
+            // channel is enough to mint a token with a fresh lifetime.
+            const channels =
+                this.guardedChannels.size > 0
+                    ? [...this.guardedChannels]
+                    : [...this.publicChannels].slice(0, 1);
+
+            for (const channelName of channels) {
                 const response = await this.requestToken(
                     channelName,
                     nextToken,

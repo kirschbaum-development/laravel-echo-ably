@@ -383,18 +383,19 @@ Create the Echo instance **once per browser tab**, at module scope or in a provi
 
 **Presence re-enters on re-attach.** When Ably re-attaches a channel after a dropped connection, the driver re-enters the presence set — otherwise the member would be silently absent from then on. Other clients may observe that as an `update`, or as a `joining()` call for a member they already knew about.
 
-**Public channels ride an authenticated connection.** Ably authenticates the connection, not the channel, and the driver requests a token the first time you subscribe to a private or presence channel. `ably/laravel-broadcaster` grants `public:*` on every token it signs, so public channels work on any connection your app has already authenticated. An app that subscribes to _nothing but_ public channels never triggers a token request, so its connection has no credential to offer. Give it one up front:
+**Public channels authenticate the connection too.** Ably authenticates the _connection_, not the channel, so every client needs a credential — including one that only ever subscribes to public channels. The driver requests a token on the first subscribe of any kind and renews it from the channels still in use, so a public-only app connects and stays connected with no extra configuration:
 
 ```ts
-new Echo({
-    broadcaster: AblyConnector,
-    ably: { clientOptions: { token: tokenFromYourEndpoint } },
-});
+new Echo({ broadcaster: AblyConnector });
+
+Echo.channel("ticker").listen("PriceUpdated", (event) => console.log(event));
 ```
 
-That static token has an expiry cliff: it dies at its TTL and nothing renews it. The driver's auth callback renews by asking `/broadcasting/auth` for the last channel it was granted capability for, and a public-only connection never made such a request — so its token cache is empty and there is nothing to renew from. When the token expires the connection is left without a credential. Tracked as [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
+`ably/laravel-broadcaster` grants `public:*` on every token it signs, so a public subscribe never needs a capability _upgrade_ — once any token is in hand, further public channels cost no request at all. A public channel's token request is also best effort: if `/broadcasting/auth` is down the channel still attaches, and the credential problem surfaces as a connection error rather than as a subscription that silently never happened.
 
-For anything longer-lived than a page view, hand the driver a client that can authenticate itself instead — `authUrl` (or a key, server-side only) gives ably-js its own renewal path, and a public-only app never triggers the driver's own token push, so that configuration stays in force:
+Your auth endpoint must be willing to sign a token for a public channel name (`public:ticker`). `ably/laravel-broadcaster` is; a custom `requestTokenFn` should be too.
+
+If you would rather keep authentication out of the driver entirely, hand it a client that authenticates itself — `authUrl` (or a key, server-side only) gives ably-js its own credential and renewal path. The driver only pushes a token of its own once a channel needs one, so a client that is already authenticated keeps its own configuration until then:
 
 ```ts
 import * as Ably from "ably";
@@ -537,7 +538,6 @@ The built-in broadcaster is `pusher-js` against Ably's Pusher-protocol adapter. 
 - **Encrypted private channels.** `Echo.encryptedPrivate()` throws for any non-Pusher connector — Echo's core gates it with an `instanceof` check on its own connectors, so no third-party driver can implement it today.
 - **Typed hook payloads.** `configureEcho({broadcaster: AblyConnector})` type-checks, but Echo routes constructor broadcasters through a slot typed `any`, so `useEcho` payloads do not resolve to this driver's channel classes until the upstream `laravel/echo` PRs land.
 - **Page-reload recovery.** Replay heals a live connection's gap; it does not carry a cursor across a page load. Ably's own connection `recover` key is available through `clientOptions` if you need it.
-- **Connections that only ever use public channels.** Supply a token through `clientOptions`, or a self-authenticating `client` — see the note above, and [#4](https://github.com/kirschbaum-development/laravel-echo-ably/issues/4).
 
 Progress and requests: [github.com/kirschbaum-development/laravel-echo-ably/issues](https://github.com/kirschbaum-development/laravel-echo-ably/issues).
 

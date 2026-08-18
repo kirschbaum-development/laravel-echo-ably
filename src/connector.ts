@@ -407,6 +407,12 @@ export class AblyConnector extends Connector<
             channel.unsubscribe();
 
             delete this.channels[name];
+
+            // The manager rebuilds capability channel by channel on renewal,
+            // so a name it still tracks outlives the subscription that needed
+            // it: a request that can only fail once the user is no longer
+            // authorized for the channel, taking the renewal with it.
+            this.tokenManager.untrackChannel(name);
         });
     }
 
