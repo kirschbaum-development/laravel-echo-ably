@@ -108,6 +108,15 @@ export class AblyConnector extends Connector<
     private recoverySpent = false;
 
     /**
+     * Removes the listeners `bindConnection` put on the current client.
+     *
+     * Assigned by `connect()`, which the base constructor calls before this
+     * class's field initializers run — so it carries no initializer of its own
+     * to overwrite it with.
+     */
+    private unbindConnection!: () => void;
+
+    /**
      * How every channel on this connection replays missed events, normalized
      * once here. Assigned by `connect()`, which the base constructor calls
      * before this class's field initializers run — so it carries no initializer
@@ -147,15 +156,26 @@ export class AblyConnector extends Connector<
     }
 
     private bindConnection(client: Realtime): void {
-        client.connection.on("connected", () => {
+        const onConnected = () => {
             // A working connection closes the recovery cycle: whatever comes
             // after it is a new problem, not the old one still failing.
             this.recoverySpent = false;
-        });
+        };
 
-        client.connection.on("failed", (change: ConnectionStateChange) => {
+        const onFailed = (change: ConnectionStateChange) => {
             this.recoverFromClientIdMismatch(change);
-        });
+        };
+
+        client.connection.on("connected", onConnected);
+        client.connection.on("failed", onFailed);
+
+        // Kept so a replacement can stop listening to the client it replaced:
+        // that client is nobody's connection afterwards, and anything it still
+        // reports would drive a connector that has moved on.
+        this.unbindConnection = () => {
+            client.connection.off(onConnected);
+            client.connection.off(onFailed);
+        };
     }
 
     /**
@@ -424,6 +444,10 @@ export class AblyConnector extends Connector<
             : this.createClient(driverOptions);
 
         this.tokenManager.trackChannels(Object.keys(this.channels));
+        // Before the replacement is adopted: the outgoing client keeps the
+        // clientId ably rejected, and a 40102 it reported from here would
+        // otherwise ask for a replacement of the replacement.
+        this.unbindConnection();
         this.ably = replacement;
         this.tokenManager.setClient(replacement);
         this.bindConnection(replacement);
@@ -440,10 +464,13 @@ export class AblyConnector extends Connector<
             channel.replaceClient(replacement, this.tokenManager);
         });
 
-        // Close the old connection cycle. A supplied factory is the safe path
-        // for a client whose clientId changed; the call also preserves normal
-        // lifecycle notifications for injected clients.
-        previous.connect();
+        // The client that was replaced is finished, and closing it is the
+        // whole point of replacing it: it still carries the clientId ably
+        // rejected, so a client left open here is a second connection — billed
+        // and counted against the connection limit — that fails the same way
+        // and, once the replacement's `connected` re-arms the budget, asks for
+        // a replacement of its own.
+        previous.close();
         replacement.connect();
     }
 }

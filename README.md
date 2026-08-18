@@ -107,6 +107,7 @@ new Echo({
 | ---------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `clientOptions`  | `Partial<Ably.ClientOptions>`                             | Merged into the options the driver hands `new Ably.Realtime(...)`.                 |
 | `client`         | `Ably.Realtime`                                           | Use a client you built yourself, instead of one the driver builds.                 |
+| `clientFactory`  | `() => Ably.Realtime`                                     | Builds a replacement client when Ably reports 40102 — required with `client`.      |
 | `requestTokenFn` | `(channelName, existingToken) => Promise<{token, info?}>` | Replaces the driver's own request to `authEndpoint`.                               |
 | `channelOptions` | `Record<string, Ably.ChannelOptions>`                     | Per-channel Ably options, keyed by **resolved** channel name (`"private:orders"`). |
 | `replay`         | `boolean \| {limit?: number}`                             | Opt into replaying missed events after a continuity gap — see below.               |
@@ -140,6 +141,25 @@ new Echo({ broadcaster: AblyConnector, ably: { client } });
 The driver uses the instance as it is — transport, plugins, auth configuration — and routes capability upgrades through it. One caveat worth knowing: the first private or presence subscribe hands the client a token signed by `ably/laravel-broadcaster`, since that is the only thing carrying Laravel's channel capability, and `auth.authorize()` _replaces_ ably's stored auth options rather than merging them. The driver includes its own `authCallback` in that call, so token renewal keeps working and goes to `authEndpoint` from then on — but the `authUrl` or key the instance was built with is no longer consulted. A client that only ever serves public channels never reaches that point and keeps its own auth story intact.
 
 This is the escape hatch for the modular build (smaller bundles) and for auth stories the driver does not model.
+
+### `clientFactory`
+
+Ably ties a connection's `clientId` to the credential it opened with, so an identity change — a login, a logout — surfaces as error 40102 and cannot be fixed on the connection that hit it. The driver recovers by building a replacement client, moving every live channel onto it, and closing the one that was stranded.
+
+That works out of the box when the driver built the client. When _you_ supplied one through `client`, the driver has no way to build another, so give it a factory:
+
+```ts
+import * as Ably from "ably";
+
+const makeClient = () => new Ably.Realtime({ authUrl: "/ably/token" });
+
+new Echo({
+    broadcaster: AblyConnector,
+    ably: { client: makeClient(), clientFactory: makeClient },
+});
+```
+
+The factory must return a **new** client each call — returning the same instance hands the driver back the connection it is trying to replace. Without a factory, an injected client gets a best-effort reconnect instead, which will not clear a genuine `clientId` mismatch.
 
 ### `requestTokenFn`
 

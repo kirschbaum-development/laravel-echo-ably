@@ -1031,6 +1031,72 @@ describe("AblyConnector", () => {
         });
     });
 
+    describe("replacing the client a mismatch stranded", () => {
+        /** A connector whose client the driver owns, so a 40102 replaces it. */
+        function owned() {
+            const built: MockRealtime[] = [];
+
+            realtimeConstructor.mockImplementation(function () {
+                const client = createMockRealtime();
+
+                built.push(client);
+
+                return client;
+            });
+
+            const connector = new AblyConnector(
+                echoOptions({
+                    requestTokenFn: vi.fn().mockResolvedValue({ token: TOKEN }),
+                }),
+            );
+
+            return { built, connector };
+        }
+
+        it("closes the client it replaced", async () => {
+            const { built, connector } = owned();
+
+            await settle(connector.privateChannel("orders"));
+
+            const previous = built[0];
+
+            failWithMismatch(previous);
+            await flush();
+
+            // The replacement carries the new identity; the client it replaced
+            // is finished. Leaving it open costs a second Ably connection —
+            // billed, counted against the connection limit, and delivering
+            // messages to listeners nothing reads any more.
+            expect(connector.ably).not.toBe(previous);
+            expect(previous.close).toHaveBeenCalledTimes(1);
+            expect(previous.connect).not.toHaveBeenCalled();
+        });
+
+        it("does not let the client it replaced ask for another replacement", async () => {
+            const { built, connector } = owned();
+
+            await settle(connector.privateChannel("orders"));
+
+            const previous = built[0];
+
+            failWithMismatch(previous);
+            await flush();
+
+            // The replacement connecting is what re-arms the recovery budget.
+            (
+                connector.ably as unknown as MockRealtime
+            ).connection.emitStateChange({ current: "connected" });
+
+            // The client that was replaced still carries the old clientId, so
+            // ably fails it the same way. It is nobody's connection now, and a
+            // replacement for it would be the second of a growing set.
+            failWithMismatch(previous);
+            await flush();
+
+            expect(built).toHaveLength(2);
+        });
+    });
+
     describe("disconnect", () => {
         it("closes the ably connection", () => {
             const { realtime, connector } = setup();
