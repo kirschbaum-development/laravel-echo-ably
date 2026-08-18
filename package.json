@@ -1,6 +1,6 @@
 {
     "name": "@kirschbaum-development/laravel-echo-ably",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Native Ably (ably-js v2) driver for Laravel Echo 2.x",
     "keywords": [
         "laravel",

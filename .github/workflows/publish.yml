@@ -47,9 +47,10 @@ jobs:
 
             - uses: actions/setup-node@v7
               with:
-                  node-version: 22
+                  node-version: 24
                   cache: npm
                   registry-url: https://registry.npmjs.org
+                  package-manager-cache: false
 
             - run: npm ci
 
@@ -103,12 +104,9 @@ jobs:
 
             - name: Publish
               if: github.event_name == 'push' || !inputs.dry_run
-              # Swap for npm trusted publishing (no token, OIDC only) once the
-              # package exists: configure this repo and workflow as a trusted
-              # publisher on npmjs.com, then drop the NODE_AUTH_TOKEN line.
-              env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-              run: npm publish --provenance --access public
+              # npm trusted publishing exchanges this run's OIDC token for a
+              # short-lived publish credential. No npm token secret is used.
+              run: npm publish --access public
 
             - name: Create the GitHub release
               if: github.event_name == 'push'
