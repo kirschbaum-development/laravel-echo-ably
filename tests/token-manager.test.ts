@@ -105,7 +105,7 @@ function callAuthCallback(
 }
 
 /** Minimal stand-in for the bits of `Realtime` the manager touches. */
-function fakeClient() {
+function fakeClient(state: string = "connected") {
     // Typed with ably's own parameters so a test can read back the auth options
     // the push carried, not just that it happened.
     const authorize = vi.fn(
@@ -116,7 +116,10 @@ function fakeClient() {
     );
 
     return {
-        client: { auth: { authorize } } as unknown as Realtime,
+        client: {
+            auth: { authorize },
+            connection: { state },
+        } as unknown as Realtime,
         authorize,
     };
 }
@@ -455,6 +458,31 @@ describe("ensureCapability", () => {
         ]);
         expect(manager.currentToken()).toBe(second);
     });
+});
+
+describe("a connection the app closed", () => {
+    it.each(["closing", "closed"])(
+        "keeps a new token off a %s connection, and offers it once the app reconnects",
+        async (state) => {
+            // ably reopens a closed connection when a token is pushed onto it,
+            // and closed is the app's decision (Echo.disconnect()).
+            const jwt = token({ "private:orders": ["*"] });
+            stubFetch(jsonResponse({ token: jwt }));
+            const { client, authorize } = fakeClient(state);
+            const manager = new TokenManager(ECHO_OPTIONS, {});
+
+            manager.setClient(client);
+            await manager.ensureCapability("private:orders");
+
+            expect(authorize).not.toHaveBeenCalled();
+            expect(manager.currentToken()).toBe(jwt);
+
+            const [error, details] = await callAuthCallback(manager);
+
+            expect(error).toBeNull();
+            expect(details?.token).toBe(jwt);
+        },
+    );
 });
 
 describe("auth request timeout", () => {

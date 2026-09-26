@@ -340,6 +340,7 @@ export class AblyChannel extends Channel {
         if (
             this.left ||
             this.resubscribeTimer !== null ||
+            this.connectionClosed() ||
             isAuthorizationDenial(error)
         ) {
             return;
@@ -362,11 +363,24 @@ export class AblyChannel extends Channel {
     }
 
     private resubscribe(): void {
-        if (this.left) {
+        if (this.left || this.connectionClosed()) {
             return;
         }
 
         this.ready = this.subscribe();
+    }
+
+    /**
+     * Whether the connection was closed on purpose — `Echo.disconnect()`, or
+     * ably closing it on unload. A retry then would be an auth request nobody
+     * needs, and its token push would reopen the connection behind the app's
+     * back. Nothing is lost by waiting: reconnecting through the connector
+     * re-subscribes every channel.
+     */
+    private connectionClosed(): boolean {
+        const { state } = this.ably.connection;
+
+        return state === "closing" || state === "closed";
     }
 
     private cancelResubscribe(): void {

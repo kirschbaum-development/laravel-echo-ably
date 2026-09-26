@@ -868,6 +868,40 @@ describe("AblyConnector", () => {
         });
     });
 
+    describe("a status subscriber that throws", () => {
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        it("still lets every other subscriber hear the change, and reports the throw", () => {
+            vi.useFakeTimers();
+
+            const { realtime, connector } = setup();
+            const failure = new Error("subscriber bug");
+            const before = vi.fn();
+            const after = vi.fn();
+            const changes: string[] = [];
+
+            connector.onConnectionChange(before);
+            connector.onConnectionChange(() => {
+                throw failure;
+            });
+            connector.onConnectionChange(after);
+            connector.onConnectionStateChange((change) =>
+                changes.push(change.current),
+            );
+
+            realtime.connection.emitStateChange({ current: "connected" });
+
+            expect(before).toHaveBeenCalledWith("connected");
+            expect(after).toHaveBeenCalledWith("connected");
+            expect(changes).toEqual(["connected"]);
+
+            // Rethrown on its own task rather than swallowed.
+            expect(() => vi.runAllTimers()).toThrow(failure);
+        });
+    });
+
     describe("onConnectionStateChange", () => {
         it("hands over ably's own state change, reason and code intact", () => {
             const { realtime, connector } = setup();

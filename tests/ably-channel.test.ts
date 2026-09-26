@@ -429,6 +429,7 @@ describe("AblyChannel", () => {
     describe("retrying a failed subscribe", () => {
         afterEach(() => {
             vi.useRealTimers();
+            vi.restoreAllMocks();
         });
 
         /** A capability request that fails `failures` times, then succeeds. */
@@ -490,6 +491,8 @@ describe("AblyChannel", () => {
 
         it("backs off between consecutive failures", async () => {
             vi.useFakeTimers();
+            // No jitter, so the delays are exactly 1s then 2s.
+            vi.spyOn(Math, "random").mockReturnValue(0.5);
 
             const { ensureCapability } = setup({
                 ensureCapability: failingCapability([
@@ -498,15 +501,81 @@ describe("AblyChannel", () => {
                 ]),
             });
 
-            await vi.advanceTimersByTimeAsync(1_200);
+            await vi.advanceTimersByTimeAsync(999);
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(1);
             expect(ensureCapability).toHaveBeenCalledTimes(2);
 
-            // The second delay is 2s, so 1.5s later nothing has run yet.
-            await vi.advanceTimersByTimeAsync(1_500);
+            await vi.advanceTimersByTimeAsync(1_999);
             expect(ensureCapability).toHaveBeenCalledTimes(2);
 
-            await vi.advanceTimersByTimeAsync(1_000);
+            await vi.advanceTimersByTimeAsync(1);
             expect(ensureCapability).toHaveBeenCalledTimes(3);
+        });
+
+        it.each([
+            [0, 800],
+            [0.75, 1_100],
+        ])(
+            "jitters a delay by up to a fifth either way (random %s)",
+            async (random, delay) => {
+                vi.useFakeTimers();
+                vi.spyOn(Math, "random").mockReturnValue(random);
+
+                const { ensureCapability } = setup({
+                    ensureCapability: failingCapability([new Error("down")]),
+                });
+
+                await vi.advanceTimersByTimeAsync(delay - 1);
+                expect(ensureCapability).toHaveBeenCalledTimes(1);
+
+                await vi.advanceTimersByTimeAsync(1);
+                expect(ensureCapability).toHaveBeenCalledTimes(2);
+            },
+        );
+
+        it("holds its retry while the app has the connection closed", async () => {
+            vi.useFakeTimers();
+
+            const { channel, realtime, ensureCapability } = setup({
+                ensureCapability: failingCapability([new Error("down")]),
+            });
+
+            await vi.advanceTimersByTimeAsync(0);
+
+            // Echo.disconnect(): a retry now would ask for a token nobody
+            // needs, and pushing it would reopen the connection.
+            realtime.connection.emitStateChange({
+                current: "closed",
+                previous: "closing",
+            });
+            await vi.advanceTimersByTimeAsync(60_000);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
+
+            // Reconnecting through the connector re-subscribes every channel.
+            realtime.connection.emitStateChange({
+                current: "connected",
+                previous: "connecting",
+            });
+            channel.ready = channel.subscribe();
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(2);
+        });
+
+        it("schedules no retry for a subscribe that failed on a closed connection", async () => {
+            vi.useFakeTimers();
+
+            const { realtime, ensureCapability } = setup({
+                ensureCapability: failingCapability([new Error("closed")]),
+            });
+
+            realtime.connection.emitStateChange({ current: "closed" });
+            await vi.advanceTimersByTimeAsync(60_000);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
         });
 
         it("does not retry a channel the auth endpoint refused with a 403", async () => {

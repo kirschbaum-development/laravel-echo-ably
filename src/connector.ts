@@ -189,9 +189,21 @@ export class AblyConnector extends Connector<
         const relay = (change: ConnectionStateChange) => {
             // Copied first: a subscriber that unsubscribes from inside its own
             // callback must not disturb the run it is part of.
-            [...this.connectionListeners].forEach((listener) =>
-                listener(change),
-            );
+            [...this.connectionListeners].forEach((listener) => {
+                // Each subscriber used to be its own ably listener, and ably
+                // isolates listener exceptions; one relay listener has to do
+                // that itself, or a throw leaves every later subscriber on a
+                // stale status. Rethrown on its own task, the way a browser
+                // reports an exception from an event listener, rather than
+                // swallowed.
+                try {
+                    listener(change);
+                } catch (error) {
+                    setTimeout(() => {
+                        throw error;
+                    });
+                }
+            });
         };
 
         client.connection.on("connected", onConnected);

@@ -11,6 +11,12 @@ const NO_TOKEN =
 /** How long one auth request may take unless `ably.authTimeoutMs` says otherwise. */
 const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
 
+function isClosed(client: Realtime): boolean {
+    const { state } = client.connection;
+
+    return state === "closing" || state === "closed";
+}
+
 /**
  * A failed request to the auth endpoint. `status` is the HTTP status when the
  * server answered, which is how a channel tells a 403 — never retried — from a
@@ -206,7 +212,11 @@ export class TokenManager {
                 this.info.set(channelName, response.info);
             }
 
-            if (opts.push && this.client) {
+            // Pushing onto a closed connection would reopen it, and closed is
+            // the app's decision (`Echo.disconnect()`). The token stays cached
+            // either way, and the auth callback offers it once the app
+            // reconnects.
+            if (opts.push && this.client && !isClosed(this.client)) {
                 await this.client.auth.authorize(undefined, {
                     token: response.token,
                     // Carried deliberately: ably *replaces* its stored auth
