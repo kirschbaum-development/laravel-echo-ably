@@ -869,15 +869,8 @@ describe("AblyConnector", () => {
     });
 
     describe("a status subscriber that throws", () => {
-        afterEach(() => {
-            vi.useRealTimers();
-        });
-
-        it("still lets every other subscriber hear the change, and reports the throw", () => {
-            vi.useFakeTimers();
-
-            const { realtime, connector } = setup();
-            const failure = new Error("subscriber bug");
+        /** Three subscribers, the middle one throwing `failure`. */
+        function subscribeAround(connector: AblyConnector, failure: Error) {
             const before = vi.fn();
             const after = vi.fn();
             const changes: string[] = [];
@@ -891,14 +884,61 @@ describe("AblyConnector", () => {
                 changes.push(change.current),
             );
 
+            return { before, after, changes };
+        }
+
+        it("still lets every other subscriber hear the change", () => {
+            const { realtime, connector } = setup();
+            const { before, after, changes } = subscribeAround(
+                connector,
+                new Error("subscriber bug"),
+            );
+
             realtime.connection.emitStateChange({ current: "connected" });
 
             expect(before).toHaveBeenCalledWith("connected");
             expect(after).toHaveBeenCalledWith("connected");
             expect(changes).toEqual(["connected"]);
+        });
 
-            // Rethrown on its own task rather than swallowed.
-            expect(() => vi.runAllTimers()).toThrow(failure);
+        it("logs the throw through the client's logger, as ably did, and never rethrows it", () => {
+            vi.useFakeTimers();
+
+            try {
+                const { realtime, connector } = setup();
+
+                subscribeAround(connector, new Error("subscriber bug"));
+                realtime.connection.emitStateChange({ current: "connected" });
+
+                expect(realtime.logger?.logAction).toHaveBeenCalledWith(
+                    1,
+                    "EventEmitter.emit()",
+                    expect.stringContaining(
+                        "Unexpected listener exception: Error: subscriber bug; stack = ",
+                    ),
+                );
+                // Nothing left to throw on a later task.
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("falls back to ably's default handler on a client without its logger", () => {
+            const warn = vi
+                .spyOn(console, "warn")
+                .mockImplementation(() => undefined);
+            const { realtime, connector } = setup();
+
+            realtime.logger = undefined;
+            subscribeAround(connector, new Error("subscriber bug"));
+            realtime.connection.emitStateChange({ current: "connected" });
+
+            expect(warn).toHaveBeenCalledWith(
+                expect.stringContaining(
+                    "Ably: EventEmitter.emit(): Unexpected listener exception: Error: subscriber bug",
+                ),
+            );
         });
     });
 

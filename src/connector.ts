@@ -193,15 +193,11 @@ export class AblyConnector extends Connector<
                 // Each subscriber used to be its own ably listener, and ably
                 // isolates listener exceptions; one relay listener has to do
                 // that itself, or a throw leaves every later subscriber on a
-                // stale status. Rethrown on its own task, the way a browser
-                // reports an exception from an event listener, rather than
-                // swallowed.
+                // stale status.
                 try {
                     listener(change);
                 } catch (error) {
-                    setTimeout(() => {
-                        throw error;
-                    });
+                    logListenerException(client, error);
                 }
             });
         };
@@ -527,6 +523,44 @@ export class AblyConnector extends Connector<
         previous.close();
         replacement.connect();
     }
+}
+
+/**
+ * The logger every ably client carries at runtime. ably's public typings leave
+ * it out, so it is reached structurally and may be absent on a stand-in client.
+ */
+type ClientWithLogger = {
+    logger?: {
+        logAction?: (level: number, action: string, message: string) => void;
+    };
+};
+
+/** ably's `Logger.LOG_ERROR`. */
+const LOG_ERROR = 1;
+
+/**
+ * Report a status subscriber's exception the way ably reported it when each
+ * subscriber was its own listener: its `EventEmitter` catches the throw and
+ * logs it at error level through the client's logger, which honours the app's
+ * `logLevel` and `logHandler`. Same action and message, so existing log
+ * filters keep matching. Never rethrown: an uncaught error would end a Node
+ * process and land in the page's error tracker, where 0.1.5 only logged.
+ */
+function logListenerException(client: Realtime, error: unknown): void {
+    const message = `Unexpected listener exception: ${String(error)}; stack = ${
+        error instanceof Error ? error.stack : undefined
+    }`;
+    const logger = (client as unknown as ClientWithLogger).logger;
+
+    if (typeof logger?.logAction === "function") {
+        logger.logAction(LOG_ERROR, "EventEmitter.emit()", message);
+
+        return;
+    }
+
+    // ably's default error handler, for a client without ably's logger.
+    // eslint-disable-next-line no-console
+    console.warn(`Ably: EventEmitter.emit(): ${message}`);
 }
 
 /**

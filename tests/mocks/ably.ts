@@ -1,3 +1,4 @@
+import type { Mock } from "vitest";
 import { vi } from "vitest";
 
 /**
@@ -466,6 +467,9 @@ export class MockRealtime {
         clientId: null as string | null,
         authorize: vi.fn((): Promise<unknown> => Promise.resolve(null)),
     };
+
+    /** ably's runtime logger, which its public typings leave out. */
+    logger: { logAction: Mock } | undefined = { logAction: vi.fn() };
 
     close = vi.fn((): void => {});
     connect = vi.fn((): void => {});
