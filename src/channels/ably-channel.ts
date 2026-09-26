@@ -42,6 +42,15 @@ type InboundListener = (message: InboundMessage) => void;
 type StateListener = (change: ChannelStateChange) => void;
 
 /**
+ * How long a channel waits before retrying a subscribe that failed before ably
+ * owned its state, by attempt; the last delay repeats. Each is jittered by up
+ * to a fifth either way, so tabs that failed together do not retry together.
+ */
+const RESUBSCRIBE_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
+const RESUBSCRIBE_JITTER_RATIO = 0.2;
+
+/**
  * The live channel instances sharing each underlying ably channel, by client
  * and resolved name.
  *
@@ -184,6 +193,15 @@ export class AblyChannel extends Channel {
      */
     private failureReportedByState = false;
 
+    /** The pending retry of a failed subscribe, if one is scheduled. */
+    private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** Consecutive failed subscribes, which picks the next retry's delay. */
+    private resubscribeAttempt = 0;
+
+    /** Set by `unsubscribe()`: a channel that was left is never retried. */
+    private left = false;
+
     /**
      * Create a new class instance.
      */
@@ -264,6 +282,8 @@ export class AblyChannel extends Channel {
             this.registerCatchAll();
 
             await this.subscription.attach();
+
+            this.resubscribeAttempt = 0;
         } catch (error) {
             if (generation !== this.bindingGeneration) {
                 return;
@@ -271,15 +291,105 @@ export class AblyChannel extends Channel {
 
             // Ownership: anything the channel reported as a state change
             // belongs to the state listener, which is where the
-            // `onChannelFailed` hook gets its say. Only failures that never
-            // became a channel state — a rejected capability request, a
-            // connection-level attach rejection — are surfaced from here.
+            // `onChannelFailed` hook gets its say — and ably, which retries a
+            // suspended channel on its own. Only failures that never became a
+            // channel state — a rejected capability request, a connection-level
+            // attach rejection — are surfaced and retried from here.
             if (this.failureReportedByState) {
                 return;
             }
 
+            // A capability request that failed never reached `channels.get`,
+            // so the registrations queued behind it found no channel and were
+            // dropped. The listener maps still hold every one of them, and
+            // restoring from them is what the retry's `subscribe()` does.
+            if (!this.hasSubscription) {
+                this.restoringSubscriptions = true;
+            }
+
             this.dispatchError(error);
+            this.scheduleResubscribe(error);
         }
+    }
+
+    /**
+     * Retry a failed subscribe now rather than when its backoff runs out — the
+     * connection coming back is the moment it is most likely to work. A channel
+     * with no retry pending has nothing to retry.
+     */
+    resubscribeIfFailed(): void {
+        if (this.resubscribeTimer === null) {
+            return;
+        }
+
+        this.cancelResubscribe();
+        this.resubscribe();
+    }
+
+    /**
+     * Queue the next attempt at a subscribe that failed before ably owned the
+     * channel's state.
+     *
+     * Without it, one failed `/broadcasting/auth` request — a deploy, a 5xx, a
+     * dropped connection — leaves the channel unattached for the life of the
+     * page while every `listen()` on it quietly never fires. A 403 is the one
+     * failure not retried: the server has said this user may not have the
+     * channel, and asking again will not change its answer.
+     */
+    private scheduleResubscribe(error: unknown): void {
+        if (
+            this.left ||
+            this.resubscribeTimer !== null ||
+            this.connectionClosed() ||
+            isAuthorizationDenial(error)
+        ) {
+            return;
+        }
+
+        const base =
+            RESUBSCRIBE_DELAYS_MS[
+                Math.min(
+                    this.resubscribeAttempt,
+                    RESUBSCRIBE_DELAYS_MS.length - 1,
+                )
+            ];
+        const jitter = 1 + (Math.random() * 2 - 1) * RESUBSCRIBE_JITTER_RATIO;
+
+        this.resubscribeAttempt += 1;
+        this.resubscribeTimer = setTimeout(() => {
+            this.resubscribeTimer = null;
+            this.resubscribe();
+        }, base * jitter);
+    }
+
+    private resubscribe(): void {
+        if (this.left || this.connectionClosed()) {
+            return;
+        }
+
+        this.ready = this.subscribe();
+    }
+
+    /**
+     * Whether the connection was closed on purpose — `Echo.disconnect()`, or
+     * ably closing it on unload. A retry then would be an auth request nobody
+     * needs, and its token push would reopen the connection behind the app's
+     * back. Nothing is lost by waiting: reconnecting through the connector
+     * re-subscribes every channel.
+     */
+    private connectionClosed(): boolean {
+        const { state } = this.ably.connection;
+
+        return state === "closing" || state === "closed";
+    }
+
+    private cancelResubscribe(): void {
+        if (this.resubscribeTimer === null) {
+            return;
+        }
+
+        clearTimeout(this.resubscribeTimer);
+        this.resubscribeTimer = null;
     }
 
     /**
@@ -290,6 +400,11 @@ export class AblyChannel extends Channel {
         const previous = this.hasSubscription ? this.subscription : null;
 
         this.bindingGeneration += 1;
+
+        // The subscribe below is this channel's fresh start on the new client,
+        // so a retry left over from the old one would only duplicate it.
+        this.cancelResubscribe();
+        this.resubscribeAttempt = 0;
 
         if (previous) {
             if (this.catchAllListener) {
@@ -346,6 +461,9 @@ export class AblyChannel extends Channel {
             [...wrappers.values()].map((wrapper) => ({ event, wrapper })),
         );
         const global = [...this.globalListeners.values()];
+
+        this.left = true;
+        this.cancelResubscribe();
 
         this.listeners.clear();
         this.globalListeners.clear();
@@ -1005,6 +1123,25 @@ export class AblyChannel extends Channel {
 
         return driverOptions.channelOptions?.[this.name];
     }
+}
+
+/**
+ * Whether a failure is the server refusing this user the channel: an HTTP 403
+ * from the auth endpoint, carried as `status` by the driver's own request (and
+ * by most fetch wrappers a `requestTokenFn` is built on), or as `statusCode` by
+ * an ably `ErrorInfo`.
+ */
+function isAuthorizationDenial(error: unknown): boolean {
+    if (typeof error !== "object" || error === null) {
+        return false;
+    }
+
+    const { status, statusCode } = error as {
+        status?: unknown;
+        statusCode?: unknown;
+    };
+
+    return status === 403 || statusCode === 403;
 }
 
 /**

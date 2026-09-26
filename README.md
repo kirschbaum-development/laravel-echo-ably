@@ -97,20 +97,22 @@ new Echo({
         clientOptions: {}, // merged into the Ably.Realtime options
         client: undefined, // a pre-built Realtime instance
         requestTokenFn: undefined, // replaces the built-in auth request
+        authTimeoutMs: 10000, // abandon an auth request that takes longer
         channelOptions: {}, // resolved channel name → Ably.ChannelOptions
         replay: false, // replay the events a lost attachment missed
     },
 });
 ```
 
-| Option           | Type                                                      | Purpose                                                                            |
-| ---------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `clientOptions`  | `Partial<Ably.ClientOptions>`                             | Merged into the options the driver hands `new Ably.Realtime(...)`.                 |
-| `client`         | `Ably.Realtime`                                           | Use a client you built yourself, instead of one the driver builds.                 |
-| `clientFactory`  | `() => Ably.Realtime`                                     | Builds a replacement client when Ably reports 40102 — required with `client`.      |
-| `requestTokenFn` | `(channelName, existingToken) => Promise<{token, info?}>` | Replaces the driver's own request to `authEndpoint`.                               |
-| `channelOptions` | `Record<string, Ably.ChannelOptions>`                     | Per-channel Ably options, keyed by **resolved** channel name (`"private:orders"`). |
-| `replay`         | `boolean \| {limit?: number}`                             | Opt into replaying missed events after a continuity gap — see below.               |
+| Option           | Type                                                                | Purpose                                                                            |
+| ---------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `clientOptions`  | `Partial<Ably.ClientOptions>`                                       | Merged into the options the driver hands `new Ably.Realtime(...)`.                 |
+| `client`         | `Ably.Realtime`                                                     | Use a client you built yourself, instead of one the driver builds.                 |
+| `clientFactory`  | `() => Ably.Realtime`                                               | Builds a replacement client when Ably reports 40102 — required with `client`.      |
+| `requestTokenFn` | `(channelName, existingToken, {signal}) => Promise<{token, info?}>` | Replaces the driver's own request to `authEndpoint`.                               |
+| `authTimeoutMs`  | `number`                                                            | How long one auth request may take before it is abandoned. Defaults to 10000.      |
+| `channelOptions` | `Record<string, Ably.ChannelOptions>`                               | Per-channel Ably options, keyed by **resolved** channel name (`"private:orders"`). |
+| `replay`         | `boolean \| {limit?: number}`                                       | Opt into replaying missed events after a continuity gap — see below.               |
 
 ### `clientOptions`
 
@@ -169,11 +171,15 @@ The driver's own auth request is a `fetch` POST to `authEndpoint` carrying `{cha
 import axios from "axios";
 import type { RequestTokenFn } from "@kirschbaum-development/laravel-echo-ably";
 
-const requestTokenFn: RequestTokenFn = async (channelName, existingToken) => {
+const requestTokenFn: RequestTokenFn = async (
+    channelName,
+    existingToken,
+    options,
+) => {
     const { data } = await axios.post(
         "/api/broadcasting/auth",
         { channel_name: channelName, token: existingToken },
-        { withCredentials: true },
+        { withCredentials: true, signal: options?.signal },
     );
 
     return data; // { token: "<Ably JWT>", info?: <presence data> }
@@ -181,6 +187,8 @@ const requestTokenFn: RequestTokenFn = async (channelName, existingToken) => {
 
 new Echo({ broadcaster: AblyConnector, ably: { requestTokenFn } });
 ```
+
+Auth requests run one at a time, so the driver abandons one that outlives `authTimeoutMs` (10 seconds by default) rather than let it hold every grant and renewal behind it. The rejection happens whether or not your function honours `signal`; passing the signal on is what cancels the abandoned HTTP request as well.
 
 Pass `existingToken` back to the server: `ably/laravel-broadcaster` accretes each new grant onto the capability the token already carries, so returning it is what keeps a second channel from revoking the first one's access. Return the response body untouched — `info` is the presence data the member enters with.
 
@@ -416,6 +424,10 @@ const payload: TypingPayload = { name: user.name };
 
 Echo.private("chat").whisper("typing", payload);
 ```
+
+**A subscribe that fails before the channel attaches is retried.** When the auth request fails (a 5xx, a timeout, a dropped connection) or the attach is rejected at the connection level, the failure reaches `error()` and the subscribe is tried again after 1, 2, 5 and 10 seconds, then every 30 seconds, each jittered by up to a fifth. The connection reaching `connected` cuts the wait short. Listeners registered in the meantime are kept and attached with the retry. A `403` from the auth endpoint is not retried, since the server has refused the channel, and neither is a failure Ably reported as a channel state: Ably re-attaches a suspended channel itself, and a `40160` has its own retry (see [Error handling](#error-handling)). Leaving the channel stops the retries, and nothing is retried while the app has the connection closed (`Echo.disconnect()`): a token pushed onto a closed connection would reopen it, and reconnecting re-subscribes every channel anyway.
+
+**Connection status subscribers survive a client swap.** `onConnectionChange()` and `onConnectionStateChange()` subscribers follow the connector, not the client: after a `40102` recovery replaces the client, they report the replacement's states and nothing further from the client it replaced. A subscriber that throws does not stop the others hearing the change; its exception is logged through the client's logger at error level, as ably logs a listener exception, so `clientOptions.logLevel` and `logHandler` apply.
 
 **A whisper sent before the ably channel exists is dropped.** If the subscribe failed at the auth step — a rejected `/broadcasting/auth` request — there is no ably channel to publish on, so the whisper is discarded silently: the failure already reached that channel's `error()` callbacks, and re-reporting it as a publish failure would say the same thing twice. A whisper on a channel whose _attach_ failed is different: the channel object exists, the publish is attempted, and ably's rejection is delivered to `error()` like any other publish failure.
 

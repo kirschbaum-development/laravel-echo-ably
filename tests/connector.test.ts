@@ -868,6 +868,80 @@ describe("AblyConnector", () => {
         });
     });
 
+    describe("a status subscriber that throws", () => {
+        /** Three subscribers, the middle one throwing `failure`. */
+        function subscribeAround(connector: AblyConnector, failure: Error) {
+            const before = vi.fn();
+            const after = vi.fn();
+            const changes: string[] = [];
+
+            connector.onConnectionChange(before);
+            connector.onConnectionChange(() => {
+                throw failure;
+            });
+            connector.onConnectionChange(after);
+            connector.onConnectionStateChange((change) =>
+                changes.push(change.current),
+            );
+
+            return { before, after, changes };
+        }
+
+        it("still lets every other subscriber hear the change", () => {
+            const { realtime, connector } = setup();
+            const { before, after, changes } = subscribeAround(
+                connector,
+                new Error("subscriber bug"),
+            );
+
+            realtime.connection.emitStateChange({ current: "connected" });
+
+            expect(before).toHaveBeenCalledWith("connected");
+            expect(after).toHaveBeenCalledWith("connected");
+            expect(changes).toEqual(["connected"]);
+        });
+
+        it("logs the throw through the client's logger, as ably did, and never rethrows it", () => {
+            vi.useFakeTimers();
+
+            try {
+                const { realtime, connector } = setup();
+
+                subscribeAround(connector, new Error("subscriber bug"));
+                realtime.connection.emitStateChange({ current: "connected" });
+
+                expect(realtime.logger?.logAction).toHaveBeenCalledWith(
+                    1,
+                    "EventEmitter.emit()",
+                    expect.stringContaining(
+                        "Unexpected listener exception: Error: subscriber bug; stack = ",
+                    ),
+                );
+                // Nothing left to throw on a later task.
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("falls back to ably's default handler on a client without its logger", () => {
+            const warn = vi
+                .spyOn(console, "warn")
+                .mockImplementation(() => undefined);
+            const { realtime, connector } = setup();
+
+            realtime.logger = undefined;
+            subscribeAround(connector, new Error("subscriber bug"));
+            realtime.connection.emitStateChange({ current: "connected" });
+
+            expect(warn).toHaveBeenCalledWith(
+                expect.stringContaining(
+                    "Ably: EventEmitter.emit(): Unexpected listener exception: Error: subscriber bug",
+                ),
+            );
+        });
+    });
+
     describe("onConnectionStateChange", () => {
         it("hands over ably's own state change, reason and code intact", () => {
             const { realtime, connector } = setup();
@@ -1121,6 +1195,72 @@ describe("AblyConnector", () => {
             await flush();
 
             expect(built).toHaveLength(2);
+        });
+
+        it("keeps connection status subscribers on the replacement", async () => {
+            const { built, connector } = owned();
+            const statuses: string[] = [];
+            const changes: string[] = [];
+
+            connector.onConnectionChange((status) => statuses.push(status));
+            connector.onConnectionStateChange((change) =>
+                changes.push(change.current),
+            );
+
+            await settle(connector.privateChannel("orders"));
+
+            const previous = built[0];
+
+            failWithMismatch(previous);
+            await flush();
+
+            const replacement = connector.ably as unknown as MockRealtime;
+
+            replacement.connection.emitStateChange({
+                current: "connecting",
+                previous: "initialized",
+            });
+            replacement.connection.emitStateChange({
+                current: "connected",
+                previous: "connecting",
+            });
+
+            // Whatever the replaced client reports after it was replaced
+            // describes nobody's connection.
+            previous.connection.emitStateChange({
+                current: "closed",
+                previous: "closing",
+            });
+
+            expect(statuses).toEqual(["failed", "connecting", "connected"]);
+            expect(changes).toEqual(["failed", "connecting", "connected"]);
+        });
+    });
+
+    describe("retrying failed subscribes", () => {
+        it("retries a channel whose subscribe failed as soon as the connection comes back", async () => {
+            const requestTokenFn = vi
+                .fn()
+                .mockRejectedValueOnce(new Error("auth endpoint down"))
+                .mockResolvedValue({ token: TOKEN });
+            const { realtime, connector } = setup({ requestTokenFn });
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            expect(realtime.channels.get).not.toHaveBeenCalled();
+
+            realtime.connection.emitStateChange({
+                current: "connected",
+                previous: "disconnected",
+            });
+            await settle(channel);
+
+            expect(requestTokenFn).toHaveBeenCalledTimes(2);
+            expect(realtime.channels.get).toHaveBeenCalledWith(
+                "private:orders",
+                undefined,
+            );
         });
     });
 

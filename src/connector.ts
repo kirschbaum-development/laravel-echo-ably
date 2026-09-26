@@ -125,6 +125,20 @@ export class AblyConnector extends Connector<
     private replayConfig!: NormalizedReplay;
 
     /**
+     * The `onConnectionChange` / `onConnectionStateChange` subscribers, fed by
+     * whichever client is current. Held here rather than on the client because
+     * a 40102 recovery swaps the client: subscribers bound to the one it
+     * replaced would hear that client close and then nothing, reporting a
+     * working connection as disconnected for the life of the page.
+     *
+     * Read only when a state change is relayed, never during `connect()`, so
+     * the field initializer running after the base constructor is harmless.
+     */
+    private readonly connectionListeners = new Set<
+        (change: ConnectionStateChange) => void
+    >();
+
+    /**
      * Create a fresh Ably connection.
      */
     connect(): void {
@@ -160,14 +174,37 @@ export class AblyConnector extends Connector<
             // A working connection closes the recovery cycle: whatever comes
             // after it is a new problem, not the old one still failing.
             this.recoverySpent = false;
+
+            // A subscribe that failed while the connection was down is most
+            // likely to work now, so its backoff is cut short.
+            Object.values(this.channels).forEach((channel) =>
+                channel.resubscribeIfFailed(),
+            );
         };
 
         const onFailed = (change: ConnectionStateChange) => {
             this.recoverFromClientIdMismatch(change);
         };
 
+        const relay = (change: ConnectionStateChange) => {
+            // Copied first: a subscriber that unsubscribes from inside its own
+            // callback must not disturb the run it is part of.
+            [...this.connectionListeners].forEach((listener) => {
+                // Each subscriber used to be its own ably listener, and ably
+                // isolates listener exceptions; one relay listener has to do
+                // that itself, or a throw leaves every later subscriber on a
+                // stale status.
+                try {
+                    listener(change);
+                } catch (error) {
+                    logListenerException(client, error);
+                }
+            });
+        };
+
         client.connection.on("connected", onConnected);
         client.connection.on("failed", onFailed);
+        client.connection.on(relay);
 
         // Kept so a replacement can stop listening to the client it replaced:
         // that client is nobody's connection afterwards, and anything it still
@@ -175,6 +212,7 @@ export class AblyConnector extends Connector<
         this.unbindConnection = () => {
             client.connection.off(onConnected);
             client.connection.off(onFailed);
+            client.connection.off(relay);
         };
     }
 
@@ -296,15 +334,11 @@ export class AblyConnector extends Connector<
     onConnectionChange(
         callback: (status: ConnectionStatus) => void,
     ): () => void {
-        const listener = (change: ConnectionStateChange) => {
-            // Mapped from the change rather than re-read off the connection,
-            // so the callback describes the transition it was handed.
-            callback(CONNECTION_STATUS[change.current]);
-        };
-
-        this.ably.connection.on(listener);
-
-        return () => this.ably.connection.off(listener);
+        // Mapped from the change rather than re-read off the connection, so the
+        // callback describes the transition it was handed.
+        return this.addConnectionListener((change) =>
+            callback(CONNECTION_STATUS[change.current]),
+        );
     }
 
     /**
@@ -322,11 +356,21 @@ export class AblyConnector extends Connector<
     onConnectionStateChange(
         callback: (change: ConnectionStateChange) => void,
     ): () => void {
-        const listener = (change: ConnectionStateChange) => callback(change);
+        return this.addConnectionListener((change) => callback(change));
+    }
 
-        this.ably.connection.on(listener);
+    /**
+     * Subscribe to the current client's state changes, and to its
+     * replacement's after a 40102 recovery. Returns an unsubscriber.
+     */
+    private addConnectionListener(
+        listener: (change: ConnectionStateChange) => void,
+    ): () => void {
+        this.connectionListeners.add(listener);
 
-        return () => this.ably.connection.off(listener);
+        return () => {
+            this.connectionListeners.delete(listener);
+        };
     }
 
     /**
@@ -479,6 +523,44 @@ export class AblyConnector extends Connector<
         previous.close();
         replacement.connect();
     }
+}
+
+/**
+ * The logger every ably client carries at runtime. ably's public typings leave
+ * it out, so it is reached structurally and may be absent on a stand-in client.
+ */
+type ClientWithLogger = {
+    logger?: {
+        logAction?: (level: number, action: string, message: string) => void;
+    };
+};
+
+/** ably's `Logger.LOG_ERROR`. */
+const LOG_ERROR = 1;
+
+/**
+ * Report a status subscriber's exception the way ably reported it when each
+ * subscriber was its own listener: its `EventEmitter` catches the throw and
+ * logs it at error level through the client's logger, which honours the app's
+ * `logLevel` and `logHandler`. Same action and message, so existing log
+ * filters keep matching. Never rethrown: an uncaught error would end a Node
+ * process and land in the page's error tracker, where 0.1.5 only logged.
+ */
+function logListenerException(client: Realtime, error: unknown): void {
+    const message = `Unexpected listener exception: ${String(error)}; stack = ${
+        error instanceof Error ? error.stack : undefined
+    }`;
+    const logger = (client as unknown as ClientWithLogger).logger;
+
+    if (typeof logger?.logAction === "function") {
+        logger.logAction(LOG_ERROR, "EventEmitter.emit()", message);
+
+        return;
+    }
+
+    // ably's default error handler, for a client without ably's logger.
+    // eslint-disable-next-line no-console
+    console.warn(`Ably: EventEmitter.emit(): ${message}`);
 }
 
 /**

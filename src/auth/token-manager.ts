@@ -8,6 +8,30 @@ import { parseJwt, toTokenDetails } from "./jwt";
 const NO_TOKEN =
     "No Ably token available yet: subscribe to a channel before authenticating.";
 
+/** How long one auth request may take unless `ably.authTimeoutMs` says otherwise. */
+const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+
+function isClosed(client: Realtime): boolean {
+    const { state } = client.connection;
+
+    return state === "closing" || state === "closed";
+}
+
+/**
+ * A failed request to the auth endpoint. `status` is the HTTP status when the
+ * server answered, which is how a channel tells a 403 — never retried — from a
+ * failure worth trying again; absent when there was no answer at all.
+ */
+export class AuthRequestError extends Error {
+    constructor(
+        message: string,
+        readonly status?: number,
+    ) {
+        super(message);
+        this.name = "AuthRequestError";
+    }
+}
+
 /** The slice of Echo's options the manager needs to reach `/broadcasting/auth`. */
 export type TokenManagerEchoOptions = {
     authEndpoint: string;
@@ -188,7 +212,11 @@ export class TokenManager {
                 this.info.set(channelName, response.info);
             }
 
-            if (opts.push && this.client) {
+            // Pushing onto a closed connection would reopen it, and closed is
+            // the app's decision (`Echo.disconnect()`). The token stays cached
+            // either way, and the auth callback offers it once the app
+            // reconnects.
+            if (opts.push && this.client && !isClosed(this.client)) {
                 await this.client.auth.authorize(undefined, {
                     token: response.token,
                     // Carried deliberately: ably *replaces* its stored auth
@@ -370,14 +398,53 @@ export class TokenManager {
         return Boolean(capability[`${namespace}:*`]);
     }
 
+    /**
+     * One auth request, abandoned once it outlives the timeout.
+     *
+     * Requests run one at a time, so a request that never settles would hold
+     * every grant and renewal behind it forever: new channels would never
+     * attach and the connection would lose its credential at expiry. The
+     * timeout rejects even when a custom `requestTokenFn` ignores the abort
+     * signal it is handed, because the queue only needs the promise to settle.
+     */
     private async requestToken(
         channelName: string,
         existingToken: string | null,
     ): Promise<TokenResponse> {
+        const timeoutMs = this.authTimeoutMs();
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+                const error = new AuthRequestError(
+                    `Auth request timed out after ${timeoutMs}ms`,
+                );
+
+                controller.abort(error);
+                reject(error);
+            }, timeoutMs);
+        });
+
+        try {
+            return await Promise.race([
+                this.fetchToken(channelName, existingToken, controller.signal),
+                timeout,
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    private async fetchToken(
+        channelName: string,
+        existingToken: string | null,
+        signal: AbortSignal,
+    ): Promise<TokenResponse> {
         const { requestTokenFn } = this.driverOptions;
 
         if (requestTokenFn) {
-            return requestTokenFn(channelName, existingToken);
+            return requestTokenFn(channelName, existingToken, { signal });
         }
 
         const response = await fetch(this.echoOptions.authEndpoint, {
@@ -390,14 +457,27 @@ export class TokenManager {
                 channel_name: channelName,
                 token: existingToken,
             }),
+            signal,
         });
 
         if (!response.ok) {
-            throw new Error(
+            throw new AuthRequestError(
                 `Auth request failed with status ${response.status}`,
+                response.status,
             );
         }
 
         return (await response.json()) as TokenResponse;
+    }
+
+    /** The configured auth timeout; anything but a positive number means the default. */
+    private authTimeoutMs(): number {
+        const { authTimeoutMs } = this.driverOptions;
+
+        return typeof authTimeoutMs === "number" &&
+            Number.isFinite(authTimeoutMs) &&
+            authTimeoutMs > 0
+            ? authTimeoutMs
+            : DEFAULT_AUTH_TIMEOUT_MS;
     }
 }
