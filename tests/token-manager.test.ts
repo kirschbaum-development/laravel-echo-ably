@@ -7,7 +7,7 @@ import type {
 } from "ably";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TokenManagerEchoOptions } from "../src/auth/token-manager";
-import { TokenManager } from "../src/auth/token-manager";
+import { AuthRequestError, TokenManager } from "../src/auth/token-manager";
 import type { RequestTokenFn } from "../src/types";
 import { makeJwt } from "./helpers";
 
@@ -450,10 +450,79 @@ describe("ensureCapability", () => {
 
         expect(fetchMock).not.toHaveBeenCalled();
         expect(requestTokenFn.mock.calls).toEqual([
-            ["private:a", null],
-            ["private:b", first],
+            ["private:a", null, { signal: expect.any(AbortSignal) }],
+            ["private:b", first, { signal: expect.any(AbortSignal) }],
         ]);
         expect(manager.currentToken()).toBe(second);
+    });
+});
+
+describe("auth request timeout", () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+    });
+
+    it("abandons a request that never settles, so the requests behind it still run", async () => {
+        vi.useFakeTimers();
+
+        const later = token({ "private:b": ["*"] });
+        const requestTokenFn = vi
+            .fn<RequestTokenFn>()
+            .mockReturnValueOnce(new Promise(() => undefined))
+            .mockResolvedValueOnce({ token: later });
+        const manager = new TokenManager(ECHO_OPTIONS, {
+            requestTokenFn,
+            authTimeoutMs: 5_000,
+        });
+
+        const hung = manager.ensureCapability("private:a");
+        const behind = manager.ensureCapability("private:b");
+        const hungOutcome = hung.catch((error: unknown) => error);
+
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        const error = await hungOutcome;
+
+        expect(error).toBeInstanceOf(AuthRequestError);
+        expect((error as AuthRequestError).message).toBe(
+            "Auth request timed out after 5000ms",
+        );
+        await expect(behind).resolves.toBeUndefined();
+        expect(manager.currentToken()).toBe(later);
+    });
+
+    it("aborts the signal it handed the timed-out request", async () => {
+        vi.useFakeTimers();
+
+        let signal: AbortSignal | undefined;
+        const requestTokenFn = vi.fn<RequestTokenFn>((_, __, options) => {
+            signal = options?.signal;
+
+            return new Promise(() => undefined);
+        });
+        const manager = new TokenManager(ECHO_OPTIONS, { requestTokenFn });
+
+        const outcome = manager
+            .ensureCapability("private:a")
+            .catch(() => undefined);
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        await outcome;
+
+        expect(signal?.aborted).toBe(true);
+    });
+
+    it("reports the status of a refused request", async () => {
+        stubFetch(jsonResponse({ message: "Forbidden" }, 403));
+        const manager = new TokenManager(ECHO_OPTIONS, {});
+
+        const error = await manager
+            .ensureCapability("private:a")
+            .catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(AuthRequestError);
+        expect((error as AuthRequestError).status).toBe(403);
     });
 });
 

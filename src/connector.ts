@@ -125,6 +125,20 @@ export class AblyConnector extends Connector<
     private replayConfig!: NormalizedReplay;
 
     /**
+     * The `onConnectionChange` / `onConnectionStateChange` subscribers, fed by
+     * whichever client is current. Held here rather than on the client because
+     * a 40102 recovery swaps the client: subscribers bound to the one it
+     * replaced would hear that client close and then nothing, reporting a
+     * working connection as disconnected for the life of the page.
+     *
+     * Read only when a state change is relayed, never during `connect()`, so
+     * the field initializer running after the base constructor is harmless.
+     */
+    private readonly connectionListeners = new Set<
+        (change: ConnectionStateChange) => void
+    >();
+
+    /**
      * Create a fresh Ably connection.
      */
     connect(): void {
@@ -160,14 +174,29 @@ export class AblyConnector extends Connector<
             // A working connection closes the recovery cycle: whatever comes
             // after it is a new problem, not the old one still failing.
             this.recoverySpent = false;
+
+            // A subscribe that failed while the connection was down is most
+            // likely to work now, so its backoff is cut short.
+            Object.values(this.channels).forEach((channel) =>
+                channel.resubscribeIfFailed(),
+            );
         };
 
         const onFailed = (change: ConnectionStateChange) => {
             this.recoverFromClientIdMismatch(change);
         };
 
+        const relay = (change: ConnectionStateChange) => {
+            // Copied first: a subscriber that unsubscribes from inside its own
+            // callback must not disturb the run it is part of.
+            [...this.connectionListeners].forEach((listener) =>
+                listener(change),
+            );
+        };
+
         client.connection.on("connected", onConnected);
         client.connection.on("failed", onFailed);
+        client.connection.on(relay);
 
         // Kept so a replacement can stop listening to the client it replaced:
         // that client is nobody's connection afterwards, and anything it still
@@ -175,6 +204,7 @@ export class AblyConnector extends Connector<
         this.unbindConnection = () => {
             client.connection.off(onConnected);
             client.connection.off(onFailed);
+            client.connection.off(relay);
         };
     }
 
@@ -296,15 +326,11 @@ export class AblyConnector extends Connector<
     onConnectionChange(
         callback: (status: ConnectionStatus) => void,
     ): () => void {
-        const listener = (change: ConnectionStateChange) => {
-            // Mapped from the change rather than re-read off the connection,
-            // so the callback describes the transition it was handed.
-            callback(CONNECTION_STATUS[change.current]);
-        };
-
-        this.ably.connection.on(listener);
-
-        return () => this.ably.connection.off(listener);
+        // Mapped from the change rather than re-read off the connection, so the
+        // callback describes the transition it was handed.
+        return this.addConnectionListener((change) =>
+            callback(CONNECTION_STATUS[change.current]),
+        );
     }
 
     /**
@@ -322,11 +348,21 @@ export class AblyConnector extends Connector<
     onConnectionStateChange(
         callback: (change: ConnectionStateChange) => void,
     ): () => void {
-        const listener = (change: ConnectionStateChange) => callback(change);
+        return this.addConnectionListener((change) => callback(change));
+    }
 
-        this.ably.connection.on(listener);
+    /**
+     * Subscribe to the current client's state changes, and to its
+     * replacement's after a 40102 recovery. Returns an unsubscriber.
+     */
+    private addConnectionListener(
+        listener: (change: ConnectionStateChange) => void,
+    ): () => void {
+        this.connectionListeners.add(listener);
 
-        return () => this.ably.connection.off(listener);
+        return () => {
+            this.connectionListeners.delete(listener);
+        };
     }
 
     /**

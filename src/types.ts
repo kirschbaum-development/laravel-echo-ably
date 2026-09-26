@@ -47,9 +47,14 @@ export type EchoOptionsWithDefaults = Channel["options"];
 
 export type TokenResponse = { token: string; info?: unknown };
 
+/**
+ * `signal` aborts when the request outlives `ably.authTimeoutMs`; pass it to
+ * `fetch` (or your HTTP client) so the abandoned request is cancelled too.
+ */
 export type RequestTokenFn = (
     channelName: string,
     existingToken: string | null,
+    options?: { signal: AbortSignal },
 ) => Promise<TokenResponse>;
 
 export type AblyDriverOptions = {
@@ -61,6 +66,11 @@ export type AblyDriverOptions = {
      */
     clientFactory?: () => Realtime;
     requestTokenFn?: RequestTokenFn;
+    /**
+     * How long one auth request may take before it is abandoned, in
+     * milliseconds. Defaults to 10000.
+     */
+    authTimeoutMs?: number;
     channelOptions?: Record<string, ChannelOptions>;
     /**
      * Replay events missed while the connection had no continuity. Off by

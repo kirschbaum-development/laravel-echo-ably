@@ -1122,6 +1122,72 @@ describe("AblyConnector", () => {
 
             expect(built).toHaveLength(2);
         });
+
+        it("keeps connection status subscribers on the replacement", async () => {
+            const { built, connector } = owned();
+            const statuses: string[] = [];
+            const changes: string[] = [];
+
+            connector.onConnectionChange((status) => statuses.push(status));
+            connector.onConnectionStateChange((change) =>
+                changes.push(change.current),
+            );
+
+            await settle(connector.privateChannel("orders"));
+
+            const previous = built[0];
+
+            failWithMismatch(previous);
+            await flush();
+
+            const replacement = connector.ably as unknown as MockRealtime;
+
+            replacement.connection.emitStateChange({
+                current: "connecting",
+                previous: "initialized",
+            });
+            replacement.connection.emitStateChange({
+                current: "connected",
+                previous: "connecting",
+            });
+
+            // Whatever the replaced client reports after it was replaced
+            // describes nobody's connection.
+            previous.connection.emitStateChange({
+                current: "closed",
+                previous: "closing",
+            });
+
+            expect(statuses).toEqual(["failed", "connecting", "connected"]);
+            expect(changes).toEqual(["failed", "connecting", "connected"]);
+        });
+    });
+
+    describe("retrying failed subscribes", () => {
+        it("retries a channel whose subscribe failed as soon as the connection comes back", async () => {
+            const requestTokenFn = vi
+                .fn()
+                .mockRejectedValueOnce(new Error("auth endpoint down"))
+                .mockResolvedValue({ token: TOKEN });
+            const { realtime, connector } = setup({ requestTokenFn });
+            const channel = connector.privateChannel("orders");
+
+            await settle(channel);
+
+            expect(realtime.channels.get).not.toHaveBeenCalled();
+
+            realtime.connection.emitStateChange({
+                current: "connected",
+                previous: "disconnected",
+            });
+            await settle(channel);
+
+            expect(requestTokenFn).toHaveBeenCalledTimes(2);
+            expect(realtime.channels.get).toHaveBeenCalledWith(
+                "private:orders",
+                undefined,
+            );
+        });
     });
 
     describe("disconnect", () => {

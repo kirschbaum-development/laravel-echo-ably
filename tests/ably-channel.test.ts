@@ -1,5 +1,5 @@
 import type { ChannelOptions, ChannelStateChange } from "ably";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AblyChannel } from "../src/channels/ably-channel";
 import type { ChannelHarness, ChannelOverrides } from "./helpers";
 import {
@@ -423,6 +423,166 @@ describe("AblyChannel", () => {
 
             expect(callback).toHaveBeenCalledTimes(1);
             expect(callback).toHaveBeenCalledWith(reason);
+        });
+    });
+
+    describe("retrying a failed subscribe", () => {
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        /** A capability request that fails `failures` times, then succeeds. */
+        function failingCapability(failures: unknown[]) {
+            const ensureCapability = vi.fn();
+
+            failures.forEach((failure) =>
+                ensureCapability.mockRejectedValueOnce(failure),
+            );
+            ensureCapability.mockResolvedValue(undefined);
+
+            return ensureCapability;
+        }
+
+        it("retries a subscribe whose capability request failed, and delivers to listeners registered before it", async () => {
+            vi.useFakeTimers();
+
+            const { channel, realtime, underlying, ensureCapability } = setup({
+                ensureCapability: failingCapability([
+                    new Error("auth endpoint down"),
+                ]),
+            });
+            const callback = vi.fn();
+
+            channel.listen(".OrderShipped", callback);
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(realtime.channels.get).not.toHaveBeenCalled();
+
+            // The first delay is 1s, jittered by up to a fifth either way.
+            await vi.advanceTimersByTimeAsync(1_200);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(2);
+            expect(underlying().attach).toHaveBeenCalledTimes(1);
+
+            underlying().emitMessage({ name: "OrderShipped", data: { id: 1 } });
+
+            expect(callback).toHaveBeenCalledWith({ id: 1 });
+        });
+
+        it("restores listeners registered while the failed subscribe waited for its retry", async () => {
+            vi.useFakeTimers();
+
+            const { channel, underlying } = setup({
+                ensureCapability: failingCapability([new Error("timeout")]),
+            });
+            const callback = vi.fn();
+
+            await vi.advanceTimersByTimeAsync(0);
+
+            channel.listen(".OrderShipped", callback);
+            await vi.advanceTimersByTimeAsync(1_200);
+
+            underlying().emitMessage({ name: "OrderShipped", data: { id: 2 } });
+
+            expect(callback).toHaveBeenCalledTimes(1);
+            expect(callback).toHaveBeenCalledWith({ id: 2 });
+        });
+
+        it("backs off between consecutive failures", async () => {
+            vi.useFakeTimers();
+
+            const { ensureCapability } = setup({
+                ensureCapability: failingCapability([
+                    new Error("down"),
+                    new Error("still down"),
+                ]),
+            });
+
+            await vi.advanceTimersByTimeAsync(1_200);
+            expect(ensureCapability).toHaveBeenCalledTimes(2);
+
+            // The second delay is 2s, so 1.5s later nothing has run yet.
+            await vi.advanceTimersByTimeAsync(1_500);
+            expect(ensureCapability).toHaveBeenCalledTimes(2);
+
+            await vi.advanceTimersByTimeAsync(1_000);
+            expect(ensureCapability).toHaveBeenCalledTimes(3);
+        });
+
+        it("does not retry a channel the auth endpoint refused with a 403", async () => {
+            vi.useFakeTimers();
+
+            const refusal = Object.assign(new Error("Forbidden"), {
+                status: 403,
+            });
+            const { channel, ensureCapability } = setup({
+                ensureCapability: failingCapability([refusal]),
+            });
+            const error = vi.fn();
+
+            channel.error(error);
+            await vi.advanceTimersByTimeAsync(60_000);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
+            expect(error).toHaveBeenCalledWith(refusal);
+        });
+
+        it("stops retrying once the channel has been left", async () => {
+            vi.useFakeTimers();
+
+            const { channel, ensureCapability } = setup({
+                ensureCapability: failingCapability([new Error("down")]),
+            });
+
+            await vi.advanceTimersByTimeAsync(0);
+            channel.unsubscribe();
+            await vi.advanceTimersByTimeAsync(60_000);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
+        });
+
+        it("retries straight away when asked to, cancelling the scheduled attempt", async () => {
+            vi.useFakeTimers();
+
+            const { channel, underlying, ensureCapability } = setup({
+                ensureCapability: failingCapability([new Error("down")]),
+            });
+
+            await vi.advanceTimersByTimeAsync(0);
+
+            channel.resubscribeIfFailed();
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(2);
+            expect(underlying().attach).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(60_000);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(2);
+        });
+
+        it("leaves a healthy channel alone when asked to retry", async () => {
+            const { channel, ensureCapability } = setup();
+
+            await settle(channel);
+
+            channel.resubscribeIfFailed();
+            await settle(channel);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
+        });
+
+        it("leaves a failure ably reported as a channel state to ably and the hook", async () => {
+            vi.useFakeTimers();
+
+            const { realtime, ensureCapability } = setup();
+
+            realtime.channels
+                .get(NAME)
+                .failAttach({ code: 40160, message: "not permitted" });
+            await vi.advanceTimersByTimeAsync(60_000);
+
+            expect(ensureCapability).toHaveBeenCalledTimes(1);
         });
     });
 
